@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+/*
+ * Jetons de design — palette PROVISOIRE, tranchée en phase 6 (TODO.md).
+ * La règle tient en une ligne : fond, texte, un accent. Rien d'autre.
+ */
+@theme {
+  --color-bg: #0e1013;
+  --color-surface: #14171c;
+  --color-raised: #1a1e24;
+  --color-edge: #262b33;
+  --color-text: #e2e6eb;
+  --color-dim: #8b93a1;
+  --color-accent: #4cc2b4;
+  --color-danger: #e0635d;
+
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-bg font-sans text-text antialiased;
+  /* Chrome d'app desktop : pas de sélection de texte par défaut, les champs la réactivent. */
+  user-select: none;
+  cursor: default;
+}
+
+input,
+textarea {
+  user-select: text;
+  cursor: text;
+}
