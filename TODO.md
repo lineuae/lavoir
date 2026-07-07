@@ -39,7 +39,8 @@ Un lavoir pour les médias : ce qui entre (fichier local ou lien) en ressort pro
 - [x] Vérification intégrée : re-scan de la copie lavée, diff avant/après affiché (« 47 → 0 champ sensible ») ; alerte rouge si résidu
 - [x] Lot : « Laver N fichiers » d'un clic, sortie à côté de l'original, original jamais modifié
 - [x] Vérifié : 2 tests d'intégration Rust (cycle inspect→clean→rescan, modes all + gps, original préservé) ; protocole stay_open validé (Node, 184 ms puis 16 ms) ; svelte-check + cargo test verts ; app démarre sans erreur
-- [ ] **Reste à faire manuellement** : clic/dépôt réel dans la fenêtre (non automatisable ici) — déposer une vraie photo, vérifier aperçu + lavage ; tester une photo verticale (orientation) et une P3 iPhone (ICC) dès qu'un vrai fichier est dispo
+- [x] Clic/dépôt réel dans la fenêtre confirmé par l'utilisateur (2026-07-07) : dépôt + aperçu + lavage OK en conditions réelles
+- [ ] Reste à valider dès qu'un vrai fichier est dispo (pas bloquant) : photo verticale → orientation conservée après lavage ; photo iPhone P3 → couleurs non délavées (ICC) ; **HEIC iPhone → le lavage écrit-il vraiment ?** (le cas le plus important, cf. phase 7 corpus)
 
 ## Phase 3 — Laver : vidéos
 
