@@ -3,5 +3,10 @@
   "identifier": "default",
   "description": "Fenêtre principale — permissions minimales, élargies uniquement quand une phase le demande.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "opener:allow-open-path",
+    "opener:allow-open-url"
+  ]
 }

@@ -27,17 +27,19 @@ Un lavoir pour les médias : ce qui entre (fichier local ou lien) en ressort pro
 
 ## Phase 2 — Laver : images
 
-- [ ] Entrée : drag & drop (événements Tauri, pas HTML5) + sélecteur de fichiers, multi-fichiers
-- [ ] Inspection exiftool `-json` en mode `-stay_open` (process persistant, sinon ~1 s de démarrage Perl par appel) : tableau groupé — Localisation, Appareil, Dates, Logiciel, Autres
-- [ ] GPS : coordonnées en clair + bouton copier + lien externe sur clic explicite — jamais de carte intégrée (zéro requête réseau avec des coordonnées)
-- [ ] Résumé-choc par fichier : « Cette photo révèle sa position, l'appareil, la date — 47 tags »
-- [ ] Vignette EXIF cachée : l'extraire et l'afficher si présente (peut montrer l'image d'avant recadrage — fuite méconnue, la montrer fait comprendre le produit)
-- [ ] Lavage sans réencodage : `exiftool -all=` en **préservant Orientation + profil ICC** (sinon photos couchées et couleurs délavées — syntaxe exacte à valider sur corpus)
-- [ ] Formats : JPEG, PNG (chunks tEXt/iTXt/zTXt/eXIf), WebP, HEIC (exiftool sait écrire le HEIC — à valider), TIFF
-- [ ] Options : tout retirer (défaut) / GPS seulement / conserver la date de prise de vue
-- [ ] Renommage neutre optionnel (`IMG_20240705_Paris.jpg` fuit aussi)
-- [ ] Vérification intégrée : re-scan de la sortie par exiftool, diff avant/après (« 47 tags → 3 techniques restants »)
-- [ ] Lot : tout laver d'un clic, sauvegarde à côté de l'original avec suffixe
+- [x] Entrée : drag & drop (événements Tauri `onDragDropEvent`, chemins réels) + sélecteur de fichiers (plugin dialog), multi-fichiers, dédup
+- [x] Inspection exiftool `-json -a -u -G1 -c %.6f` en mode `-stay_open` (session persistante sérialisée par Mutex, marqueurs `{ready<seq>}` sur stdout+stderr) ; classifieur `classify.ts` : Localisation / Appareil / Dates / Logiciel / Autres, avec dénylist technique
+- [x] GPS : coordonnées décimales signées en clair + copier + lien OpenStreetMap sur clic explicite — jamais de carte intégrée
+- [x] Résumé-choc par fichier (`shockLine`) : « Cette photo révèle sa position, l'appareil et la date — 47 champs. »
+- [x] Vignette EXIF cachée : détectée via ThumbnailLength, extraite à la demande (`extract_thumbnail`, base64) avec l'avertissement « image d'avant recadrage »
+- [x] Lavage sans réencodage : `-all= -tagsFromFile @ -Orientation -ICC_Profile -overwrite_original` — orientation et profil couleur préservés (validé sur corpus : GPS/appareil/dates/vignette supprimés, orientation « Rotate 90 CW » conservée)
+- [x] Formats : JPEG, PNG, WebP, TIFF, GIF câblés ; HEIC/HEIF/AVIF autorisés au lavage mais **write HEIC non validé sur vrai fichier** (repoussé au corpus phase 7 — pas de HEIC sous la main) ; aperçu HEIC/TIFF impossible dans le webview → pastille de format
+- [x] Options : tout retirer (défaut) / GPS seulement / conserver la date de prise de vue
+- [x] Renommage neutre optionnel (`media-0001.jpg`) ; sinon suffixe `-propre` (mot à confirmer en passe microcopie)
+- [x] Vérification intégrée : re-scan de la copie lavée, diff avant/après affiché (« 47 → 0 champ sensible ») ; alerte rouge si résidu
+- [x] Lot : « Laver N fichiers » d'un clic, sortie à côté de l'original, original jamais modifié
+- [x] Vérifié : 2 tests d'intégration Rust (cycle inspect→clean→rescan, modes all + gps, original préservé) ; protocole stay_open validé (Node, 184 ms puis 16 ms) ; svelte-check + cargo test verts ; app démarre sans erreur
+- [ ] **Reste à faire manuellement** : clic/dépôt réel dans la fenêtre (non automatisable ici) — déposer une vraie photo, vérifier aperçu + lavage ; tester une photo verticale (orientation) et une P3 iPhone (ICC) dès qu'un vrai fichier est dispo
 
 ## Phase 3 — Laver : vidéos
 

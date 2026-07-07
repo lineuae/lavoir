@@ -1,4 +1,5 @@
 mod doctor;
+mod laver;
 
 use tauri::Manager;
 
@@ -16,7 +17,15 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
-        .invoke_handler(tauri::generate_handler![doctor::sidecar_versions])
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .manage(laver::ExifState::default())
+        .invoke_handler(tauri::generate_handler![
+            doctor::sidecar_versions,
+            laver::inspect_files,
+            laver::clean_files,
+            laver::extract_thumbnail,
+        ])
         .run(tauri::generate_context!())
         .expect("erreur au lancement de lavoir");
 }

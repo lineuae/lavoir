@@ -1,0 +1,650 @@
+//! Inspection et lavage des métadonnées d'images, via exiftool.
+//!
+//! exiftool démarre lentement (déballage Perl, ~1 s) : on garde un process
+//! persistant en mode `-stay_open`, sérialisé derrière un Mutex. Chaque
+//! commande est encadrée par un marqueur `{ready<seq>}` sur stdout (via
+//! `-execute<seq>`) et sur stderr (via `-echo4`), ce qui permet de lire la
+//! sortie de bout en bout sans ambiguïté.
+//!
+//! Le lavage ne touche jamais l'original : on copie vers un fichier de sortie
+//! puis on nettoie la copie, et on la re-scanne pour prouver le résultat.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
+
+use crate::doctor;
+
+#[derive(Serialize, Clone)]
+pub struct Tag {
+    pub group: String,
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct GpsFix {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ThumbInfo {
+    pub bytes: u64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FileReport {
+    pub path: String,
+    pub file_name: String,
+    pub file_type: String,
+    pub mime_type: String,
+    pub is_video: bool,
+    pub can_clean: bool,
+    pub tags: Vec<Tag>,
+    pub gps: Option<GpsFix>,
+    pub thumbnail: Option<ThumbInfo>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanOptions {
+    /// "all" | "gps" | "keepDate"
+    pub mode: String,
+    pub rename_neutral: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanResult {
+    pub src: String,
+    pub dst: Option<String>,
+    pub dst_name: Option<String>,
+    pub after_tags: Vec<Tag>,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+// --- Session exiftool persistante -------------------------------------------
+
+pub struct ExifSession {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    stderr_rx: Receiver<String>,
+    seq: u64,
+}
+
+fn new_command(path: &Path) -> Command {
+    let mut cmd = Command::new(path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+impl ExifSession {
+    fn spawn() -> Result<Self, String> {
+        Self::spawn_at(&doctor::tool_path("exiftool"))
+    }
+
+    fn spawn_at(path: &Path) -> Result<Self, String> {
+        let mut child = new_command(path)
+            .args(["-stay_open", "True", "-@", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("exiftool ne démarre pas : {e}"))?;
+
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let stderr = child.stderr.take().unwrap();
+
+        // exiftool ne produit que quelques lignes de stderr par commande ; un
+        // thread dédié les draine pour ne jamais bloquer sur un tube plein.
+        let (tx, stderr_rx) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                match line {
+                    Ok(l) => {
+                        if tx.send(l).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+            stderr_rx,
+            seq: 0,
+        })
+    }
+
+    /// Envoie une commande (chaque argument sur sa ligne) et renvoie
+    /// (stdout, stderr) une fois le marqueur de fin reçu.
+    fn execute(&mut self, args: &[&str]) -> Result<(String, String), String> {
+        // Purge des lignes stderr résiduelles d'une commande précédente.
+        while self.stderr_rx.try_recv().is_ok() {}
+
+        self.seq += 1;
+        let marker = format!("{{ready{}}}", self.seq);
+
+        for arg in args {
+            writeln!(self.stdin, "{arg}").map_err(|e| format!("écriture exiftool : {e}"))?;
+        }
+        // -echo4 imprime le marqueur sur stderr après traitement ;
+        // -execute<seq> l'imprime sur stdout.
+        writeln!(self.stdin, "-echo4\n{marker}\n-execute{}", self.seq)
+            .map_err(|e| format!("écriture exiftool : {e}"))?;
+        self.stdin
+            .flush()
+            .map_err(|e| format!("flush exiftool : {e}"))?;
+
+        let mut out = String::new();
+        loop {
+            let mut line = String::new();
+            let n = self
+                .stdout
+                .read_line(&mut line)
+                .map_err(|e| format!("lecture exiftool : {e}"))?;
+            if n == 0 {
+                return Err("exiftool a fermé sa sortie".into());
+            }
+            if line.trim_end() == marker {
+                break;
+            }
+            out.push_str(&line);
+        }
+
+        // stderr est secondaire (détection du succès d'écriture) : on le draine
+        // jusqu'au marqueur mais sans bloquer indéfiniment si exiftool est muet.
+        let mut err = String::new();
+        loop {
+            match self.stderr_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(line) if line.trim_end() == marker => break,
+                Ok(line) => {
+                    err.push_str(&line);
+                    err.push('\n');
+                }
+                Err(_) => break,
+            }
+        }
+
+        Ok((out, err))
+    }
+}
+
+impl Drop for ExifSession {
+    fn drop(&mut self) {
+        let _ = writeln!(self.stdin, "-stay_open\nFalse");
+        let _ = self.stdin.flush();
+        let _ = self.child.wait();
+    }
+}
+
+#[derive(Default)]
+pub struct ExifState(Mutex<Option<ExifSession>>);
+
+impl ExifState {
+    /// Exécute `f` avec la session vivante ; une erreur de tube détruit la
+    /// session pour qu'elle soit reconstruite à l'appel suivant.
+    fn with<T>(&self, f: impl FnOnce(&mut ExifSession) -> Result<T, String>) -> Result<T, String> {
+        let mut guard = self.0.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(ExifSession::spawn()?);
+        }
+        let result = f(guard.as_mut().unwrap());
+        if result.is_err() {
+            *guard = None;
+        }
+        result
+    }
+}
+
+// --- Inspection --------------------------------------------------------------
+
+fn value_to_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Array(a) => a.iter().map(value_to_string).collect::<Vec<_>>().join(", "),
+        Value::Object(_) => v.to_string(),
+        Value::Null => String::new(),
+    }
+}
+
+/// Signe la coordonnée selon son hémisphère (« South »/« West » → négatif).
+fn signed(value: f64, reference: Option<&str>) -> f64 {
+    match reference.map(|r| r.chars().next().unwrap_or(' ').to_ascii_uppercase()) {
+        Some('S') | Some('W') => -value.abs(),
+        _ => value.abs(),
+    }
+}
+
+fn inspect_one(session: &mut ExifSession, path: &str) -> FileReport {
+    let file_name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+
+    let mut report = FileReport {
+        path: path.to_string(),
+        file_name,
+        file_type: String::new(),
+        mime_type: String::new(),
+        is_video: false,
+        can_clean: false,
+        tags: Vec::new(),
+        gps: None,
+        thumbnail: None,
+        error: None,
+    };
+
+    // -a doublons, -u tags inconnus (compte honnête), -G1 groupe précis,
+    // -c coordonnées GPS en degrés décimaux (sans toucher les autres tags).
+    let out = match session.execute(&[
+        "-charset",
+        "filename=UTF8",
+        "-json",
+        "-a",
+        "-u",
+        "-G1",
+        "-c",
+        "%.6f",
+        path,
+    ]) {
+        Ok((out, _)) => out,
+        Err(e) => {
+            report.error = Some(e);
+            return report;
+        }
+    };
+
+    let parsed: Vec<Value> = match serde_json::from_str(&out) {
+        Ok(v) => v,
+        Err(_) => {
+            report.error = Some("exiftool n'a pas pu lire ce fichier".into());
+            return report;
+        }
+    };
+    let Some(obj) = parsed.into_iter().next().and_then(|v| match v {
+        Value::Object(m) => Some(m),
+        _ => None,
+    }) else {
+        report.error = Some("aucune métadonnée lisible".into());
+        return report;
+    };
+
+    let mut gps_lat: Option<f64> = None;
+    let mut gps_lat_ref: Option<String> = None;
+    let mut gps_lon: Option<f64> = None;
+    let mut gps_lon_ref: Option<String> = None;
+    let mut thumb_bytes: Option<u64> = None;
+
+    for (key, value) in &obj {
+        let Some((group, name)) = key.split_once(':') else {
+            continue; // SourceFile
+        };
+
+        match group {
+            "File" => {
+                if name == "FileType" {
+                    report.file_type = value_to_string(value);
+                } else if name == "MIMEType" {
+                    report.mime_type = value_to_string(value);
+                }
+            }
+            "GPS" => match name {
+                "GPSLatitude" => gps_lat = value_to_string(value).parse().ok(),
+                "GPSLatitudeRef" => gps_lat_ref = Some(value_to_string(value)),
+                "GPSLongitude" => gps_lon = value_to_string(value).parse().ok(),
+                "GPSLongitudeRef" => gps_lon_ref = Some(value_to_string(value)),
+                _ => {}
+            },
+            _ => {}
+        }
+
+        if name == "ThumbnailLength" || name == "PreviewImageLength" {
+            if let Ok(n) = value_to_string(value).parse::<u64>() {
+                if n > 0 {
+                    thumb_bytes = Some(n);
+                }
+            }
+        }
+
+        report.tags.push(Tag {
+            group: group.to_string(),
+            name: name.to_string(),
+            value: value_to_string(value),
+        });
+    }
+
+    if let (Some(lat), Some(lon)) = (gps_lat, gps_lon) {
+        report.gps = Some(GpsFix {
+            lat: signed(lat, gps_lat_ref.as_deref()),
+            lon: signed(lon, gps_lon_ref.as_deref()),
+        });
+    }
+    report.thumbnail = thumb_bytes.map(|bytes| ThumbInfo { bytes });
+    report.is_video = report.mime_type.starts_with("video/");
+    report.can_clean = !report.is_video && is_writable_image(&report.file_type);
+
+    report
+}
+
+/// Formats image qu'exiftool sait réécrire (le lavage vidéo est phase 3).
+fn is_writable_image(file_type: &str) -> bool {
+    matches!(
+        file_type,
+        "JPEG" | "PNG" | "WEBP" | "TIFF" | "GIF" | "HEIC" | "HEIF" | "AVIF"
+    )
+}
+
+// --- Lavage ------------------------------------------------------------------
+
+fn output_path(src: &Path, rename_neutral: bool, index: usize) -> PathBuf {
+    let parent = src.parent().unwrap_or_else(|| Path::new("."));
+    let ext = src.extension().map(|e| e.to_string_lossy().into_owned());
+    let base = if rename_neutral {
+        format!("media-{:04}", index + 1)
+    } else {
+        let stem = src.file_stem().unwrap_or_default().to_string_lossy();
+        format!("{stem}-propre")
+    };
+
+    let with_ext = |name: &str| -> PathBuf {
+        match &ext {
+            Some(e) => parent.join(format!("{name}.{e}")),
+            None => parent.join(name),
+        }
+    };
+
+    let mut candidate = with_ext(&base);
+    let mut n = 2;
+    while candidate.exists() {
+        candidate = with_ext(&format!("{base}-{n}"));
+        n += 1;
+    }
+    candidate
+}
+
+fn clean_args<'a>(mode: &str, dst: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["-charset", "filename=UTF8"];
+    match mode {
+        "gps" => {
+            args.extend([
+                "-gps:all=",
+                "-xmp:gpslatitude=",
+                "-xmp:gpslongitude=",
+                "-xmp:gpsaltitude=",
+            ]);
+        }
+        "keepDate" => {
+            // Tout retirer, puis recopier orientation, profil couleur et dates.
+            args.extend([
+                "-all=",
+                "-tagsFromFile",
+                "@",
+                "-Orientation",
+                "-ICC_Profile",
+                "-DateTimeOriginal",
+                "-CreateDate",
+                "-ModifyDate",
+                "-OffsetTimeOriginal",
+            ]);
+        }
+        _ => {
+            // "all" — tout retirer sauf orientation (sinon photos couchées)
+            // et profil ICC (sinon couleurs délavées).
+            args.extend(["-all=", "-tagsFromFile", "@", "-Orientation", "-ICC_Profile"]);
+        }
+    }
+    args.push("-overwrite_original");
+    args.push(dst);
+    args
+}
+
+fn clean_one(session: &mut ExifSession, src: &str, mode: &str, dst: PathBuf) -> CleanResult {
+    let dst_name = dst
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    let dst_str = dst.to_string_lossy().into_owned();
+
+    let mut result = CleanResult {
+        src: src.to_string(),
+        dst: Some(dst_str.clone()),
+        dst_name,
+        after_tags: Vec::new(),
+        ok: false,
+        error: None,
+    };
+
+    if let Err(e) = std::fs::copy(src, &dst) {
+        result.dst = None;
+        result.error = Some(format!("copie impossible : {e}"));
+        return result;
+    }
+
+    let (_out, err) = match session.execute(&clean_args(mode, &dst_str)) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_file(&dst);
+            result.dst = None;
+            result.error = Some(e);
+            return result;
+        }
+    };
+
+    // exiftool signale l'échec d'écriture en clair sur stderr (messages anglais).
+    if err.contains("weren't updated") || err.contains("0 image files updated") {
+        let _ = std::fs::remove_file(&dst);
+        result.dst = None;
+        result.error = Some(
+            err.lines()
+                .find(|l| l.contains("rror") || l.contains("arning"))
+                .unwrap_or("exiftool n'a pas pu laver ce format")
+                .trim()
+                .to_string(),
+        );
+        return result;
+    }
+
+    // Preuve : on re-scanne la copie lavée. Le frontend compare avant/après.
+    result.after_tags = inspect_one(session, &dst_str).tags;
+    result.ok = true;
+    result
+}
+
+// --- Commandes Tauri ---------------------------------------------------------
+
+#[tauri::command]
+pub fn inspect_files(
+    state: tauri::State<ExifState>,
+    paths: Vec<String>,
+) -> Result<Vec<FileReport>, String> {
+    state.with(|session| Ok(paths.iter().map(|p| inspect_one(session, p)).collect()))
+}
+
+#[tauri::command]
+pub fn clean_files(
+    state: tauri::State<ExifState>,
+    paths: Vec<String>,
+    options: CleanOptions,
+) -> Result<Vec<CleanResult>, String> {
+    state.with(|session| {
+        Ok(paths
+            .iter()
+            .enumerate()
+            .map(|(i, src)| {
+                let dst = output_path(Path::new(src), options.rename_neutral, i);
+                clean_one(session, src, &options.mode, dst)
+            })
+            .collect())
+    })
+}
+
+/// Vignette EXIF intégrée en data-URL, extraite à la demande (appel one-shot :
+/// la sortie binaire ne passe pas par le protocole texte de stay_open).
+#[tauri::command]
+pub fn extract_thumbnail(path: String) -> Option<String> {
+    let exiftool = doctor::tool_path("exiftool");
+    let output = new_command(&exiftool)
+        .args(["-b", "-ThumbnailImage", &path])
+        .output()
+        .ok()?;
+    if output.stdout.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "data:image/jpeg;base64,{}",
+        base64_encode(&output.stdout)
+    ))
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Image-graine sans métadonnée : le test y injecte GPS/appareil/date, puis
+    // vérifie le cycle inspection → lavage → re-scan de bout en bout.
+    const SEED: &[u8] = include_bytes!("../tests/fixtures/seed.jpg");
+
+    fn session() -> ExifSession {
+        let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries/exiftool-x86_64-pc-windows-msvc.exe");
+        ExifSession::spawn_at(&exe).expect("exiftool doit être installé (fetch-sidecars.ps1)")
+    }
+
+    fn temp_seed(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("lavoir-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, SEED).unwrap();
+        path
+    }
+
+    #[test]
+    fn inspects_and_strips_a_photo() {
+        let mut s = session();
+        let src = temp_seed("inspect.jpg");
+        let src_str = src.to_string_lossy().into_owned();
+
+        // Injection d'un profil « iPhone à Paris ».
+        s.execute(&[
+            "-Make=Apple",
+            "-Model=iPhone 14 Pro",
+            "-DateTimeOriginal=2024:07:05 14:32:10",
+            "-GPSLatitude=48.858370",
+            "-GPSLatitudeRef=N",
+            "-GPSLongitude=2.294481",
+            "-GPSLongitudeRef=E",
+            "-overwrite_original",
+            &src_str,
+        ])
+        .expect("injection exiftool");
+
+        let report = inspect_one(&mut s, &src_str);
+        assert!(report.error.is_none(), "inspection : {:?}", report.error);
+        assert_eq!(report.file_type, "JPEG");
+        assert!(report.can_clean);
+        let gps = report.gps.expect("le GPS doit être détecté");
+        assert!((gps.lat - 48.858370).abs() < 1e-4, "lat = {}", gps.lat);
+        assert!((gps.lon - 2.294481).abs() < 1e-4, "lon = {}", gps.lon);
+        assert!(report.tags.iter().any(|t| t.name == "Make" && t.value == "Apple"));
+
+        // Lavage complet → copie propre, original intact.
+        let dst = output_path(&src, false, 0);
+        let result = clean_one(&mut s, &src_str, "all", dst);
+        assert!(result.ok, "lavage : {:?}", result.error);
+        assert!(src.exists(), "l'original ne doit pas être supprimé");
+
+        let residual_gps = result.after_tags.iter().filter(|t| t.group == "GPS").count();
+        assert_eq!(residual_gps, 0, "il reste du GPS après lavage");
+        assert!(
+            !result.after_tags.iter().any(|t| t.name == "Make"),
+            "la marque de l'appareil survit au lavage",
+        );
+
+        let _ = std::fs::remove_file(&src);
+        if let Some(d) = result.dst {
+            let _ = std::fs::remove_file(d);
+        }
+    }
+
+    #[test]
+    fn gps_only_keeps_the_camera() {
+        let mut s = session();
+        let src = temp_seed("gpsonly.jpg");
+        let src_str = src.to_string_lossy().into_owned();
+
+        s.execute(&[
+            "-Make=Canon",
+            "-GPSLatitude=40.7",
+            "-GPSLatitudeRef=N",
+            "-GPSLongitude=-74.0",
+            "-GPSLongitudeRef=W",
+            "-overwrite_original",
+            &src_str,
+        ])
+        .expect("injection exiftool");
+
+        let dst = output_path(&src, false, 0);
+        let result = clean_one(&mut s, &src_str, "gps", dst);
+        assert!(result.ok, "lavage gps : {:?}", result.error);
+        assert_eq!(result.after_tags.iter().filter(|t| t.group == "GPS").count(), 0);
+        assert!(
+            result.after_tags.iter().any(|t| t.name == "Make"),
+            "le mode GPS seul doit conserver l'appareil",
+        );
+
+        let _ = std::fs::remove_file(&src);
+        if let Some(d) = result.dst {
+            let _ = std::fs::remove_file(d);
+        }
+    }
+}
