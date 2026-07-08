@@ -4,7 +4,13 @@
   import { group, shockLine, sensitiveCount, BUCKET_LABELS, type Bucket } from "./classify";
   import { previewSrc, gpsText, openOnMap, extractThumbnail, revealFolder, openFile } from "./laver";
 
-  let { report, result, busy }: { report: FileReport; result: CleanResult | null; busy: boolean } = $props();
+  let {
+    report,
+    result,
+    busy,
+    progress,
+  }: { report: FileReport; result: CleanResult | null; busy: boolean; progress: number | null } =
+    $props();
 
   const grouped = $derived(group(report.tags));
   const shock = $derived(shockLine(report, grouped));
@@ -158,7 +164,23 @@
       {/if}
     </div>
   {:else if busy}
-    <div class="border-t border-edge px-4 py-2.5 text-[13px] text-dim">Lavage…</div>
+    <div class="border-t border-edge px-4 py-2.5">
+      <div class="flex items-center justify-between text-[13px] text-dim">
+        <span>Lavage…</span>
+        {#if progress !== null}
+          <span class="font-mono text-[12px] tabular-nums">{Math.round(progress)} %</span>
+        {/if}
+      </div>
+      <div class="mt-2 h-1 overflow-hidden rounded-full bg-raised">
+        {#if progress !== null}
+          <!-- Remux d'une vidéo : progression réelle (octets écrits) -->
+          <div class="h-full rounded-full bg-accent transition-[width] duration-300" style="width: {progress}%"></div>
+        {:else}
+          <!-- Taille inconnue ou fichier en attente : barre indéterminée -->
+          <div class="indeterminate h-full w-1/3 rounded-full bg-accent/70"></div>
+        {/if}
+      </div>
+    </div>
   {/if}
 </article>
 

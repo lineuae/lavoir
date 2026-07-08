@@ -19,6 +19,8 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
+use tauri::ipc::Channel;
+
 use crate::doctor;
 
 #[derive(Serialize, Clone)]
@@ -71,6 +73,16 @@ pub struct CleanResult {
     pub after_tags: Vec<Tag>,
     pub ok: bool,
     pub error: Option<String>,
+}
+
+/// Progression du lavage, diffusée par Channel pendant `clean_files`. Seul le
+/// remux vidéo en émet — l'exiftool des images est instantané ; `percent` suit
+/// les octets écrits par ffmpeg rapportés à la taille de l'entrée, indexé par
+/// le chemin source pour que le frontend sache quelle carte animer.
+#[derive(Serialize, Clone)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum CleanEvent {
+    Progress { src: String, percent: f64 },
 }
 
 // --- Session exiftool persistante -------------------------------------------
@@ -564,7 +576,17 @@ fn is_video_ext(path: &Path) -> bool {
 ///
 /// Il n'y a pas de lavage partiel sans réencodage sur une vidéo : les trois
 /// modes image (tout / GPS / date) se ramènent ici au même nettoyage complet.
-fn clean_video(session: &mut ExifSession, ffmpeg: &Path, src: &str, dst: PathBuf) -> CleanResult {
+///
+/// `on_progress` reçoit l'avancement (0-100) pendant le remux ; sans intérêt
+/// pour un petit fichier (quasi instantané), il évite la barre indéterminée sur
+/// les gros conteneurs.
+fn clean_video(
+    session: &mut ExifSession,
+    ffmpeg: &Path,
+    src: &str,
+    dst: PathBuf,
+    on_progress: impl FnMut(f64),
+) -> CleanResult {
     let dst_name = dst.file_name().map(|n| n.to_string_lossy().into_owned());
     let dst_str = dst.to_string_lossy().into_owned();
 
@@ -577,57 +599,91 @@ fn clean_video(session: &mut ExifSession, ffmpeg: &Path, src: &str, dst: PathBuf
         error: None,
     };
 
-    let output = new_command(ffmpeg)
-        .args([
-            "-y",
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            src,
-            "-map",
-            "0",
-            "-map",
-            "-0:d",
-            "-map_metadata",
-            "-1",
-            "-c",
-            "copy",
-            "-fflags",
-            "+bitexact",
-            &dst_str,
-        ])
-        .output();
-
-    match output {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => {
-            let _ = std::fs::remove_file(&dst);
-            result.dst = None;
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            result.error = Some(
-                stderr
-                    .lines()
-                    .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("ffmpeg n'a pas pu laver cette vidéo")
-                    .trim()
-                    .to_string(),
-            );
-            return result;
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&dst);
-            result.dst = None;
-            result.error = Some(format!("ffmpeg ne démarre pas : {e}"));
-            return result;
-        }
+    if let Err(msg) = run_ffmpeg_remux(ffmpeg, src, &dst_str, on_progress) {
+        let _ = std::fs::remove_file(&dst);
+        result.dst = None;
+        result.error = Some(msg);
+        return result;
     }
 
     result.after_tags = inspect_one(session, &dst_str).tags;
     result.ok = true;
     result
+}
+
+/// Le remux proprement dit. Les flags retirent les métadonnées de conteneur et
+/// les flux de données Apple (`mebx`) en copiant l'A/V bit à bit ; `+bitexact`
+/// empêche ffmpeg de resigner la sortie avec son tag encodeur. On lit la
+/// progression sur stdout (`-progress pipe:1`) : pour une copie de flux,
+/// `total_size` (octets écrits) croît vers la taille de l'entrée et tient donc
+/// lieu de pourcentage sans qu'on ait à sonder la durée. stderr (les erreurs
+/// réelles) est drainé dans un thread pour ne jamais bloquer sur un tube plein.
+/// Octets écrits → pourcentage borné à 99 (la sortie diffère légèrement de
+/// l'entrée ; le 100 est laissé au résultat final). `None` si la taille d'entrée
+/// est inconnue → le frontend garde alors sa barre indéterminée.
+fn remux_percent(written: u64, input_size: u64) -> Option<f64> {
+    (input_size > 0).then(|| (written as f64 / input_size as f64 * 100.0).min(99.0))
+}
+
+fn run_ffmpeg_remux(
+    ffmpeg: &Path,
+    src: &str,
+    dst: &str,
+    mut on_progress: impl FnMut(f64),
+) -> Result<(), String> {
+    let input_size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+
+    let mut child = new_command(ffmpeg)
+        .args([
+            "-y", "-nostdin", "-hide_banner",
+            "-loglevel", "error",
+            "-progress", "pipe:1", "-nostats",
+            "-i", src,
+            "-map", "0", "-map", "-0:d",
+            "-map_metadata", "-1",
+            "-c", "copy",
+            "-fflags", "+bitexact",
+            dst,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ffmpeg ne démarre pas : {e}"))?;
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let err_handle = thread::spawn(move || {
+        let mut buf = String::new();
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        buf
+    });
+
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        if let Some(v) = line.strip_prefix("total_size=") {
+            if let Some(pct) = v.trim().parse::<u64>().ok().and_then(|d| remux_percent(d, input_size)) {
+                on_progress(pct);
+            }
+        }
+    }
+
+    let status = child.wait().map_err(|e| format!("ffmpeg : {e}"))?;
+    let stderr_text = err_handle.join().unwrap_or_default();
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(stderr_text
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("ffmpeg n'a pas pu laver cette vidéo")
+            .trim()
+            .to_string())
+    }
 }
 
 // --- Lavage d'un téléchargement (réutilisé par recuperer.rs) -----------------
@@ -671,7 +727,9 @@ pub(crate) fn wash_download(
     let ext = ext_lower(src);
 
     let result = if is_remux_ext(&ext) {
-        state.with(|s| Ok(clean_video(s, ffmpeg, &src_str, dst.clone())))?
+        // Le lavage post-téléchargement affiche déjà un état « Lavage… » côté
+        // Récupérer : pas de progression par fichier à diffuser ici.
+        state.with(|s| Ok(clean_video(s, ffmpeg, &src_str, dst.clone(), |_| {})))?
     } else if is_image_ext(&ext) {
         state.with(|s| Ok(clean_one(s, &src_str, "all", dst.clone())))?
     } else {
@@ -698,11 +756,16 @@ pub fn inspect_files(
     state.with(|session| Ok(paths.iter().map(|p| inspect_one(session, p)).collect()))
 }
 
-#[tauri::command]
+// `async` force l'exécution hors du thread principal (Tauri l'ordonnance sur un
+// worker) : sans cela, ce lavage synchrone bloquerait la boucle d'événements et
+// les `CleanEvent` de progression ne seraient remis au webview qu'à la fin du
+// lot — la barre resterait figée. Même raison que le thread de `start_download`.
+#[tauri::command(async)]
 pub fn clean_files(
     state: tauri::State<ExifState>,
     paths: Vec<String>,
     options: CleanOptions,
+    on_event: Channel<CleanEvent>,
 ) -> Result<Vec<CleanResult>, String> {
     let ffmpeg = doctor::tool_path("ffmpeg");
     state.with(|session| {
@@ -713,7 +776,12 @@ pub fn clean_files(
                 let path = Path::new(src);
                 let dst = output_path(path, options.rename_neutral, i);
                 if is_video_ext(path) {
-                    clean_video(session, &ffmpeg, src, dst)
+                    clean_video(session, &ffmpeg, src, dst, |percent| {
+                        let _ = on_event.send(CleanEvent::Progress {
+                            src: src.clone(),
+                            percent,
+                        });
+                    })
                 } else {
                     clean_one(session, src, &options.mode, dst)
                 }
@@ -1019,7 +1087,7 @@ mod tests {
         assert!((gps.lon - 2.2945).abs() < 1e-3, "lon = {}", gps.lon);
 
         let dst = output_path(&src, false, 0);
-        let result = clean_video(&mut s, &ffmpeg, &src_str, dst);
+        let result = clean_video(&mut s, &ffmpeg, &src_str, dst, |_| {});
         assert!(result.ok, "lavage vidéo : {:?}", result.error);
         assert!(src.exists(), "l'original ne doit pas être supprimé");
 
@@ -1079,7 +1147,7 @@ mod tests {
             let copy_str = copy.to_string_lossy().into_owned();
             let dst = output_path(&copy, false, washed);
             let result = if vid {
-                clean_video(&mut s, &ffmpeg, &copy_str, dst)
+                clean_video(&mut s, &ffmpeg, &copy_str, dst, |_| {})
             } else {
                 clean_one(&mut s, &copy_str, "all", dst)
             };
@@ -1099,6 +1167,16 @@ mod tests {
 
         eprintln!("corpus : {washed} fichier(s) lavé(s)");
         assert!(failures.is_empty(), "corpus — échec(s) :\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn remux_percent_maps_bytes_and_clamps() {
+        // Taille inconnue → pas de pourcentage (barre indéterminée).
+        assert_eq!(remux_percent(1000, 0), None);
+        // Progression normale.
+        assert_eq!(remux_percent(500, 1000), Some(50.0));
+        // La sortie peut dépasser l'entrée d'un cheveu : borné à 99, jamais 100+.
+        assert_eq!(remux_percent(1010, 1000), Some(99.0));
     }
 
     #[test]

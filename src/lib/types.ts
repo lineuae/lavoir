@@ -29,6 +29,10 @@ export type CleanResult = {
   error: string | null;
 };
 
+// Progression du lavage vidéo (remux ffmpeg), diffusée par Channel, indexée par
+// chemin source. Les images n'en émettent pas (exiftool est instantané).
+export type CleanEvent = { type: "progress"; src: string; percent: number };
+
 // --- Récupérer (miroir de recuperer.rs / settings.rs) ------------------------
 
 export type Probe = {

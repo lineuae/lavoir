@@ -103,13 +103,3 @@
     </div>
   {/if}
 </article>
-
-<style>
-  @keyframes slide {
-    0% { transform: translateX(-100%); }
-    100% { transform: translateX(400%); }
-  }
-  .indeterminate {
-    animation: slide 1.1s ease-in-out infinite;
-  }
-</style>

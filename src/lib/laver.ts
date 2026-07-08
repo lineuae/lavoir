@@ -1,7 +1,7 @@
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc, Channel } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
-import type { FileReport, CleanOptions, CleanResult, GpsFix } from "./types";
+import type { FileReport, CleanOptions, CleanResult, CleanEvent, GpsFix } from "./types";
 
 const IMAGE_EXTS = ["jpg", "jpeg", "png", "webp", "tiff", "tif", "gif", "heic", "heif", "avif"];
 const VIDEO_EXTS = ["mp4", "mov", "mkv", "webm", "m4v", "avi"];
@@ -29,8 +29,14 @@ export function inspectFiles(paths: string[]): Promise<FileReport[]> {
   return invoke("inspect_files", { paths });
 }
 
-export function cleanFiles(paths: string[], options: CleanOptions): Promise<CleanResult[]> {
-  return invoke("clean_files", { paths, options });
+export function cleanFiles(
+  paths: string[],
+  options: CleanOptions,
+  onEvent: (ev: CleanEvent) => void,
+): Promise<CleanResult[]> {
+  const channel = new Channel<CleanEvent>();
+  channel.onmessage = onEvent;
+  return invoke("clean_files", { paths, options, onEvent: channel });
 }
 
 export function extractThumbnail(path: string): Promise<string | null> {

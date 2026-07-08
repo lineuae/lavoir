@@ -8,6 +8,7 @@
 
   let reports = $state<FileReport[]>([]);
   let results = $state<Record<string, CleanResult>>({});
+  let progress = $state<Record<string, number>>({});
   let dragging = $state(false);
   let inspecting = $state(false);
   let cleaning = $state(false);
@@ -44,22 +45,26 @@
   async function washAll() {
     if (cleanable.length === 0 || cleaning) return;
     cleaning = true;
+    progress = {};
     try {
       const done = await cleanFiles(
         cleanable.map((r) => r.path),
         { mode, renameNeutral },
+        (ev) => (progress = { ...progress, [ev.src]: ev.percent }),
       );
       const next = { ...results };
       for (const r of done) next[r.src] = r;
       results = next;
     } finally {
       cleaning = false;
+      progress = {};
     }
   }
 
   function clearAll() {
     reports = [];
     results = {};
+    progress = {};
   }
 
   function onKey(e: KeyboardEvent) {
@@ -172,7 +177,12 @@
         <p class="text-[13px] text-dim">Inspection…</p>
       {/if}
       {#each reports as report (report.path)}
-        <FileCard {report} result={results[report.path] ?? null} busy={cleaning && !results[report.path] && report.canClean && !report.error} />
+        <FileCard
+          {report}
+          result={results[report.path] ?? null}
+          busy={cleaning && !results[report.path] && report.canClean && !report.error}
+          progress={progress[report.path] ?? null}
+        />
       {/each}
     </div>
 
