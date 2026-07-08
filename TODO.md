@@ -86,13 +86,16 @@ Un lavoir pour les médias : ce qui entre (fichier local ou lien) en ressort pro
 
 ## Phase 7 — Packaging & vérification finale
 
-- [ ] Corpus de test réel : HEIC iPhone avec GPS, JPEG Android avec GPS, PNG avec tEXt, WebP, MOV iPhone, MP4 — script qui lave tout le corpus et **asserte zéro tag sensible** en sortie
+- [x] Harnais de corpus (`laver.rs`) : `strips_common_image_formats` injecte GPS/appareil/dates dans des graines **JPEG/PNG/WebP/TIFF**, lave, et asserte zéro tag sensible via une denylist **indépendante de `classify.ts`** (vrai contre-contrôle, `is_sensitive`) ; le remux **MOV** reste couvert par `strips_a_video`. Le harnais a débusqué et fait corriger deux vrais défauts de format : identité IFD0 des **TIFF** qui survivait à `-all=` (piège 14) et **WebP** porteur de métadonnées vu « Extended WEBP » donc affiché non lavable. Exercé de bout en bout sur un dossier de fichiers injectés (5 fichiers : JPEG/PNG/WebP/TIFF/MOV, chacun N→0)
+- [ ] **Reste (matériel) : le vrai corpus** — HEIC iPhone géotagué, MOV géotagué à la prise, JPEG Android géotagué. Déposer les fichiers dans un dossier puis `$env:LAVOIR_CORPUS="…"; cargo test corpus -- --nocapture` (`corpus_folder_when_provided` lave chaque copie et asserte zéro résidu). **write HEIC toujours pas prouvé** faute de vrai fichier — le cas le plus important
   - Chemin de transfert : **ni Phone Link ni OneDrive**. Phone Link convertit (HEIC→JPG, HEVC→H.264) et retire le GPS ; OneDrive « fichiers à la demande » laisse des placeholders tronqués / extensions mélangées. Passer par iPhone en USB → Explorateur → DCIM (Réglages → Photos → « Vers Mac ou PC → Conserver les originaux ») ou iCloud.com → originaux. Et la localisation doit être **active à la prise** (les tests de juillet 2026 étaient tous sans GPS car coupé à la capture)
-- [ ] Tests Rust : janitor, parsing de progression, sanitisation des noms
-- [ ] E2E réel : un lien public par plateforme, une vidéo > 2 Go, un lot de 20 photos, un fichier corrompu, une URL invalide
-- [ ] Build NSIS, installation réelle, sidecars OK en prod, préchauffage exiftool au démarrage (déballage Perl au premier run)
-- [ ] Attendus Windows à documenter : SmartScreen (app non signée), Defender qui flague parfois yt-dlp (faux positif connu)
-- [ ] README court + captures
+- [x] Tests Rust : janitor (`should_remove`), parsing de progression (`progress_parsing_handles_missing_fields`), sanitisation des noms (`output_path_names_and_avoids_collisions` côté lavage + `dedup_avoids_clobbering` côté téléchargement). `cargo test` **10/10 vert**, `svelte-check` 0/0
+- [ ] **Reste (réseau/matériel) : E2E réel** — un lien public **par plateforme** (YouTube validé phase 4 ; restent TikTok/X/Reddit/Instagram/Snap), une vidéo **> 2 Go**, un lot de 20 photos. Les chemins d'erreur (URL invalide, lien non supporté, contenu supprimé) sont déjà couverts par `humanize_maps_known_failures`
+- [x] Build NSIS de production vert : `lavoir_0.1.0_x64-setup.exe` (78,2 Mio), `--doctor` release **4/4** (yt-dlp 2026.07.04, ffmpeg/ffprobe 8.1.2, exiftool 13.59), sidecars + `exiftool_files` bien à côté de l'exe release
+- [ ] **Reste (matériel) : installation réelle** de l'app packagée (double-clic sur l'installeur), sidecars OK en prod hors arbre de build, préchauffage exiftool au 1er run (déballage Perl), et l'audit ProcMon complet sur l'app installée
+- [x] Attendus Windows documentés dans le README : SmartScreen (app non signée), Defender qui flague parfois yt-dlp (faux positif PyInstaller connu)
+- [x] README court écrit (deux gestes, no-trace, build depuis les sources, attendus Windows, corpus)
+- [ ] **Reste : captures d'écran** du README (depuis l'app lancée — impossible à faire sans œil sur la fenêtre)
 
 ## Réserve (hors v1 — ne pas commencer)
 
