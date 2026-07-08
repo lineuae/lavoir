@@ -28,3 +28,48 @@ export type CleanResult = {
   ok: boolean;
   error: string | null;
 };
+
+// --- Récupérer (miroir de recuperer.rs / settings.rs) ------------------------
+
+export type Probe = {
+  title: string;
+  source: string;
+  uploader: string | null;
+  durationSeconds: number | null;
+  maxHeight: number | null;
+  isLive: boolean;
+  webpageUrl: string;
+};
+
+export type Quality = "best" | "p1080" | "p720" | "audio";
+
+export type DownloadRequest = {
+  url: string;
+  quality: Quality;
+  wash: boolean;
+  destination: string;
+  cookiesFromBrowser: string | null;
+};
+
+// `type` discrimine la variante — même forme que l'enum Rust sérialisé.
+export type DownloadEvent =
+  | { type: "queued" }
+  | { type: "started" }
+  | { type: "progress"; downloaded: number | null; total: number | null; speed: number | null; eta: number | null }
+  | { type: "postprocess"; stage: string }
+  | { type: "washing" }
+  | { type: "completed"; path: string; name: string }
+  | { type: "failed"; message: string }
+  | { type: "cancelled" };
+
+export type Settings = {
+  destination: string | null;
+  cookiesFromBrowser: string | null;
+  checkYtdlpOnLaunch: boolean;
+};
+
+export type UpdateResult = {
+  updated: boolean;
+  version: string | null;
+  message: string;
+};

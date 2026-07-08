@@ -1,18 +1,29 @@
 @import "tailwindcss";
 
 /*
- * Jetons de design — palette PROVISOIRE, tranchée en phase 6 (TODO.md).
- * La règle tient en une ligne : fond, texte, un accent. Rien d'autre.
+ * Système de design — arrêté en phase 6.
+ * Référence : Raycast / Linear. Sombre, dense, clavier d'abord.
+ *
+ * Deux couleurs porteuses seulement : un accent (teal aqua — l'eau et le
+ * propre) et un rouge de danger (fuite, erreur). Tout le reste est une rampe
+ * de gris froids. On n'introduit aucune autre teinte au fil de l'eau.
+ *
+ * Échelle de texte tenue : 11 / 12 / 13 / 15 px (+ 19 px, réservé aux titres
+ * d'états vides). Graisses : 400 / 500 / 600. S'y tenir.
  */
 @theme {
-  --color-bg: #0e1013;
-  --color-surface: #14171c;
-  --color-raised: #1a1e24;
-  --color-edge: #262b33;
-  --color-text: #e2e6eb;
-  --color-dim: #8b93a1;
-  --color-accent: #4cc2b4;
-  --color-danger: #e0635d;
+  /* Gris froids, du fond quasi-noir au texte. */
+  --color-bg: #0d0f13;
+  --color-surface: #14171d;
+  --color-raised: #1c2029;
+  --color-edge: #272c35;
+  --color-faint: #5a616e;
+  --color-dim: #8b94a2;
+  --color-text: #e6e9ef;
+
+  /* Les deux seules couleurs porteuses. */
+  --color-accent: #45c8b2;
+  --color-danger: #e2665f;
 
   --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
 }
@@ -32,4 +43,27 @@ input,
 textarea {
   user-select: text;
   cursor: text;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-accent) 28%, transparent);
+}
+
+/* Barre de défilement discrète : seul le pouce se voit, au repos comme au survol. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-edge);
+  border: 2px solid transparent;
+  border-radius: 6px;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #363d48;
+  background-clip: padding-box;
 }

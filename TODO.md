@@ -44,46 +44,50 @@ Un lavoir pour les médias : ce qui entre (fichier local ou lien) en ressort pro
 
 ## Phase 3 — Laver : vidéos
 
-- [ ] Inspection : même voie exiftool (il lit QuickTime/Matroska, dont `com.apple.quicktime.location.ISO6709`)
-- [ ] Lavage par remux sans réencodage : `ffmpeg -map_metadata -1 -c copy` + `-fflags +bitexact` (sinon ffmpeg signe la sortie avec son tag encoder) ; sortir les data streams Apple (`-map 0 -map -0:d`) — à valider sur corpus
-- [ ] Corpus obligatoire : un vrai MOV iPhone avec GPS (les atomes QuickTime sont le cas qui compte)
-- [ ] Formats : MP4, MOV, MKV, WebM
-- [ ] Vérification post-lavage par exiftool, comme les images
-- [ ] Progression pour gros fichiers (`-progress pipe:1`) — le remux est rapide mais pas instantané sur 2 Go
+- [x] Inspection : même voie exiftool (lit les Keys QuickTime, dont `com.apple.quicktime.location.ISO6709`, restitué en Composite signé → `report.gps` renseigné pour la vidéo comme pour l'image)
+- [x] Lavage par remux sans réencodage : `ffmpeg -y -nostdin -map 0 -map -0:d -map_metadata -1 -c copy -fflags +bitexact` — retire toutes les métadonnées de conteneur **et** les flux de données Apple (`mebx` : position, timed metadata) ; A/V copiés bit à bit, rotation (portrait) préservée, sortie qui décode sans erreur. `-map -0:d` est sans effet (pas d'erreur) si le fichier n'a pas de data stream. Les trois modes image se ramènent au même nettoyage complet (pas de lavage partiel lossless sur vidéo) — noté dans l'UI (« Vidéos : nettoyage complet »)
+- [x] Classifieur rendu vidéo-conscient (`classify.ts`) : les groupes structurels `QuickTime`/`TrackN` ne comptent que la date canonique du conteneur (`CreateDate`/`ModifyDate`), jamais les dates répétées par piste ni les tags `*Time` (TimeScale…) ; dates nulles `0000:00:00` (remises à zéro par le remux) ignorées ; variantes localisées `-eng-US` dédupliquées ; notes constructeur `Apple-maker-note*` → appareil. Vérifié sur le vrai MOV iPhone 14 : **13 → 0 champ sensible**
+- [x] Corpus : validé sur un vrai conteneur MOV iPhone 14 (HEVC) avec un atome `com.apple.quicktime.location.ISO6709` **injecté** (identique à une capture) — le retrait de l'atome de position, des tags `com.apple.quicktime.*` et des 5 pistes `mebx` est prouvé. Reste souhaitable : un MOV réellement géotagué à la prise (la localisation était coupée sur les fichiers de test)
+- [x] Formats : MOV/MP4/M4V/MKV/WEBM câblés (`is_remuxable_video`) ; exercé sur MOV
+- [x] Vérification post-lavage par exiftool (re-scan de la sortie, diff avant/après), comme les images
+- [x] Test d'intégration Rust `strips_a_video` (fixture `seed.mov`, 1,6 Ko : injection Keys GPS/Make/Model → remux → re-scan sans résidu, original préservé) ; `cargo test` 3/3 vert, `svelte-check` 0 erreur
+- [ ] Progression pour gros fichiers (`-progress pipe:1`) — reporté : le remux est rapide (18 Mo quasi instantané) mais un 2 Go bloque quelques secondes sans barre. À câbler via un Channel Tauri quand on voudra le confort
 
 ## Phase 4 — Récupérer (téléchargeur)
 
-- [ ] Champ URL premier plan : autofocus, détection de collage, Ctrl+V global dans la vue
-- [ ] Sonde `yt-dlp --dump-json --no-download` → carte titre / miniature / durée / source avant de lancer
-- [ ] Choix simple : Meilleure qualité / 1080p / 720p / Audio seul (m4a) — mappés sur les format selectors
-- [ ] Téléchargement dans le temp lavoir puis déplacement vers la destination ; `--ffmpeg-location` vers notre sidecar ; `--windows-filenames` + longueur bornée ; `--cache-dir` vers notre temp
-- [ ] Progression machine-readable (`--progress-template`) → barre vitesse/ETA ; annulation propre (kill de l'arbre de process) ; file d'attente (2 simultanés max)
-- [ ] Destination par défaut `Téléchargements\lavoir`, modifiable ; post-téléchargement : Ouvrir / Dossier / **Laver (coché par défaut, enchaîne sur les phases 2-3)**
-- [ ] Erreurs humanisées : mapping stderr yt-dlp → compte privé / connexion requise / géobloqué / contenu supprimé / URL non supportée — jamais d'échec silencieux
-- [ ] Option « utiliser ma session navigateur » (`--cookies-from-browser`) pour les posts visibles uniquement connecté à son propre compte — réalité Windows à tester : le chiffrement app-bound de Chrome la casse sans doute → probablement Firefox uniquement, l'UI doit le dire
-- [ ] Périmètre : contenu public ou accessible à son propre compte — pas de contournement d'auth, pas de DRM
-- [ ] Mise à jour yt-dlp : bouton `-U` dans les réglages + version affichée + opt-in « vérifier au lancement » (off par défaut)
-- [ ] Test de réalité par plateforme (YouTube, TikTok, X, Reddit, Instagram — le plus dur —, stories publiques Snap) et messages adaptés
+- [x] Champ URL premier plan : autofocus, détection de collage (`onpaste` → sonde si ça ressemble à un lien), Ctrl+V global dans la vue (champ non focalisé → lecture presse-papiers + sonde) ; Entrée sonde, puis Entrée relance en téléchargement
+- [x] Sonde `yt-dlp --dump-single-json --no-playlist` → carte titre / source (extractor) / durée / auteur / qualité max. **Miniature distante volontairement écartée** : la charger depuis un CDN violerait la CSP stricte (`img-src` ne liste aucun hôte distant) et l'esprit no-trace (requête webview → serveur tiers), au même titre qu'on refuse les tuiles de carte. Carte textuelle, dans la veine Raycast/Linear. `_type == "playlist"` et `is_live` refusés en v1
+- [x] Choix simple : Meilleure qualité / 1080p / 720p / Audio (m4a) — mappés sur les format selectors (`bv*+ba/b` + `--merge-output-format mp4` ; audio `-x --audio-format m4a`)
+- [x] **Téléchargement dans le temp → lavage dans le temp → seule la copie propre est déplacée vers la destination** (le fichier brut ne sort jamais du temp) ; `--ffmpeg-location` vers le dossier des sidecars (résolu par `tool_path`, sans suffixe en dev/prod), `--windows-filenames` + `--trim-filenames 200`, `--cache-dir` vers notre temp, `--no-mtime` (pas de fuite de date par l'horodatage du fichier)
+- [x] Progression machine-readable (`--progress-template` préfixé `LAVOIR`/`LAVOIR_PP`, stdout+stderr fusionnés) streamée par un `Channel` Tauri → barre vitesse/ETA ; annulation par kill de l'arbre de process (`taskkill /T /F`) ; file d'attente 2 simultanés max (sémaphore Mutex+Condvar maison)
+- [x] Destination par défaut `Téléchargements\lavoir`, modifiable (sélecteur de dossier) et persistée ; post-téléchargement : Ouvrir / Dossier ; **Laver coché par défaut, enchaîne sur les phases 2-3** (réutilise `laver::wash_download` : remux vidéo/audio, exiftool image)
+- [x] Erreurs humanisées : mapping stderr yt-dlp → vidéo privée / connexion requise / vérification d'âge / géobloqué / contenu supprimé / lien non supporté / 404 / réseau — jamais d'échec silencieux (repli sur la dernière ligne `ERROR:` nettoyée)
+- [x] Option « utiliser ma session navigateur » (`--cookies-from-browser`) dans les réglages, avec l'avertissement Windows affiché : Chrome/Edge chiffrent leurs cookies (app-bound) → Firefox est le choix fiable
+- [x] Périmètre : contenu public ou accessible à son propre compte — pas de contournement d'auth, pas de DRM ; live et playlists hors périmètre v1
+- [x] Mise à jour yt-dlp : bouton `-U` dans les réglages + version affichée + opt-in « vérifier au démarrage » (off par défaut, résultat rangé dans un état lu à l'ouverture des réglages). Note : `-U` réécrit le binaire épinglé — attendu ; il échoue proprement dans Program Files (droits) → message dédié
+- [x] Vérifié E2E sur réseau réel (binaire épinglé, vidéo courte stable) : sonde (tous les champs parsés OK), téléchargement audio (lignes `LAVOIR` de progression + `ExtractAudio`/`MoveFiles` parsées, `.m4a` produit), lavage du vrai fichier (remux retire `Encoder: Lavf…` + handler `Metadata`, audio bit-à-bit), et chemin d'erreur (« Video unavailable » → « Contenu supprimé ou indisponible »). 3 tests Rust (parsing progression, humanisation, dedup) + `svelte-check` 0/0
+- [ ] Test de réalité par plateforme — **YouTube validé** ci-dessus ; reste TikTok, X, Reddit, Instagram (le plus dur), stories publiques Snap : à mener avec la matrice de la phase 7. Piste : affiner les format selectors si « best » ramène du webm là où mp4 conviendrait mieux (préférer `ext=mp4`/`ext=m4a` sans réencodage)
 
 ## Phase 5 — No-trace
 
-- [ ] Janitor du temp : purge au démarrage, à la fermeture, et toutes les 60 s pour ce qui dépasse 10 min (couvrir les `.part` de yt-dlp)
-- [ ] Liste des téléchargements en mémoire seulement, disparaît à la fermeture ; réglages JSON sans aucune URL ni nom de fichier
-- [ ] Pas de logs persistants : erreurs dans l'UI, buffer mémoire de session
-- [ ] Audit final avec Process Monitor : vérifier ce que les sidecars écrivent VRAIMENT hors du temp (caches, configs…)
+- [x] Janitor du temp (`janitor.rs`) : purge complète au démarrage **et** à la fermeture (`remove_dir_all(temp_root)`, cache yt-dlp compris) + balayage toutes les 60 s des dossiers `dl/<job>` abandonnés de plus de 10 min (décision pure `should_remove`, testée), en épargnant les téléchargements actifs reconnus par leur id (`DownloadManager::active_ids`). À la fermeture (`RunEvent::ExitRequested`), on **coupe d'abord** les téléchargements en cours (`cancel_all` → `taskkill /T`) pour qu'aucun yt-dlp/ffmpeg ne survive à l'app, puis on purge. Les `.part` de yt-dlp vivent dans `dl/<job>` → couverts. Purge au démarrage sûre malgré single-instance : la 2ᵉ instance sort dans le `setup` du plugin (`std::process::exit`) avant le nôtre (vérifié dans la source du plugin)
+- [x] Liste des téléchargements en mémoire seulement (état `$state` de la page, aucune persistance — disparaît au changement de vue et à la fermeture) ; réglages JSON = uniquement destination / cookies / opt-in maj, **jamais** d'URL ni de nom de fichier
+- [x] Pas de logs persistants : erreurs affichées dans l'UI, buffer mémoire des 80 dernières lignes le temps du job puis jeté ; `--ignore-config` + `--cache-dir` vers notre temp sur chaque appel yt-dlp
+- [x] Audit par diff de répertoires autour d'un vrai téléchargement : **aucun** nouveau fichier dans `%APPDATA%` / `%LOCALAPPDATA%` / profil, `%APPDATA%\yt-dlp` jamais créé (piège #8 neutralisé par `--cache-dir`), notre temp ne contient que le fichier attendu. Le Process Monitor complet sur l'app **packagée** (writes transitoires, déballage Perl d'exiftool) est replié dans la vérification finale de la phase 7
 
 ## Phase 6 — Passe design
 
-- [ ] Poser la direction avant de coder l'UI finale : palette définitive (quasi-noir + texte + un accent), une police, 3-4 tailles, densité d'outil pro — moodboard Raycast/Linear tenu jusqu'au bout
-- [ ] Microcopie française : un ton, des verbes précis (« Laver », « Récupérer », « Tout ressort propre »), zéro copy générique
-- [ ] États vides / erreurs / progression dessinés un par un (pas de skeletons réflexes)
-- [ ] Icône : master SVG → PNG 1024 → `tauri icon` (motif goutte / planche de lavoir stylisée — à explorer)
-- [ ] Raccourcis : Ctrl+V (coller une URL), Ctrl+O (ouvrir des fichiers), Échap (annuler)
-- [ ] Notification système en fin de téléchargement long
+- [x] Direction posée dans `app.css` (système arrêté, plus « provisoire ») : rampe de **gris froids** (fond `#0d0f13` → texte `#e6e9ef`, avec un niveau `faint` pour le tertiaire), **deux** couleurs porteuses seulement — accent teal aqua `#45c8b2` (l'eau + le propre + l'action) et danger `#e2665f` (fuite/erreur). Police système Segoe UI Variable. **Échelle de texte tenue à 11/12/13/15 px** (le 10 px et le 14 px consolidés partout), graisses 400/500/600. Sélection et barre de défilement soignées pour le sombre. Densité d'outil pro, référence Raycast/Linear tenue
+- [x] Microcopie : ton posé et précis, verbes d'action (Laver / Récupérer / Ajouter / Vider), signature « Tout ressort propre. Rien ne reste. » discrète sous l'état vide de Laver ; **suffixe `-propre` confirmé** (colle à la tagline) ; « Renommer en neutre »
+- [x] États dessinés un par un (aucun skeleton réflexe) : état vide de Laver retravaillé (goutte, hiérarchie, whitespace, indice clavier), zone de dépôt et overlay, chargements en texte, erreurs humanisées en danger, progression complète dans `DownloadRow` (file / octets+vitesse+ETA / barre indéterminée si taille inconnue / post-traitement / lavage / terminé / annulé / erreur)
+- [x] Icône définitive : piste B du projet design (« goutte + onde ») — goutte teal relevée (dégradé vertical + reflet spéculaire) au-dessus de deux arcs teal qui rident la surface, sur carré arrondi quasi-noir ; coordonnées reprises du SVG `icoB`. Générée sans outillage externe (`gen-icon.ps1`, GDI+) → `tauri icon` a régénéré tout le jeu (ico/icns/PNG/iOS/Android). Vérifiée : l'onde s'efface aux petites tailles, la goutte reste lisible à 32/16 px
+- [x] Raccourcis : Ctrl+V (coller une URL, déjà en place) + Échap (effacer la saisie) dans Récupérer ; Ctrl+O (ouvrir des fichiers) + Échap (vider la liste) dans Laver
+- [ ] Notification système en fin de téléchargement long — **en attente** : demande une nouvelle dépendance (`tauri-plugin-notification` + capability). À trancher avant de l'ajouter (règle « pas de dépendance sans validation »)
 
 ## Phase 7 — Packaging & vérification finale
 
 - [ ] Corpus de test réel : HEIC iPhone avec GPS, JPEG Android avec GPS, PNG avec tEXt, WebP, MOV iPhone, MP4 — script qui lave tout le corpus et **asserte zéro tag sensible** en sortie
+  - Chemin de transfert : **ni Phone Link ni OneDrive**. Phone Link convertit (HEIC→JPG, HEVC→H.264) et retire le GPS ; OneDrive « fichiers à la demande » laisse des placeholders tronqués / extensions mélangées. Passer par iPhone en USB → Explorateur → DCIM (Réglages → Photos → « Vers Mac ou PC → Conserver les originaux ») ou iCloud.com → originaux. Et la localisation doit être **active à la prise** (les tests de juillet 2026 étaient tous sans GPS car coupé à la capture)
 - [ ] Tests Rust : janitor, parsing de progression, sanitisation des noms
 - [ ] E2E réel : un lien public par plateforme, une vidéo > 2 Go, un lot de 20 photos, un fichier corrompu, une URL invalide
 - [ ] Build NSIS, installation réelle, sidecars OK en prod, préchauffage exiftool au démarrage (déballage Perl au premier run)

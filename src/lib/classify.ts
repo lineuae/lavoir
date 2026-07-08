@@ -94,14 +94,40 @@ const SOFTWARE_NAMES = new Set([
 // Groupes des « notes constructeur » : tout leur contenu décrit l'appareil.
 const MAKER_GROUPS = /^(MakerNotes|Apple|Canon|Nikon|Sony|Panasonic|Olympus|Fujifilm|Samsung|Sigma|Ricoh|Pentax|Leica|GoPro|DJI)/;
 
+// Conteneurs QuickTime/MP4 : ces groupes ne portent que la structure (en-têtes
+// de piste, tables d'échantillons, dimensions, handlers…). Seules les dates y
+// comptent ; les vraies fuites vidéo (appareil, position, objectif) vivent dans
+// les groupes Keys / VideoKeys / UserData, traités par leur nom.
+const STRUCTURAL_VIDEO = /^(QuickTime|Track\d+|Media\d+)$/;
+
+// Variante localisée qu'exiftool émet en double dans les Keys (« LensModel-eng-US »
+// à côté de « LensModel ») : on ne compte que la forme de base.
+const LOCALE_VARIANT = /-[a-z]{2,3}-[A-Z]{2}$/;
+
+// Le remux ne peut pas supprimer les dates de conteneur (mvhd/tkhd sont
+// obligatoires), seulement les remettre à zéro : une date nulle ne révèle rien.
+const NULL_DATE = /^0{4}[-:]0{2}[-:]0{2}/;
+
+const isDate = (name: string) => /Date|Time/.test(name);
+
 export function classify(tag: Tag): Bucket | null {
   if (IGNORED_GROUPS.has(tag.group)) return null;
-  if (TECHNICAL.has(tag.name)) return null;
+  if (LOCALE_VARIANT.test(tag.name)) return null;
 
+  if (STRUCTURAL_VIDEO.test(tag.group)) {
+    // Seule la date canonique du conteneur compte : les dates par piste répètent
+    // le même instant, et les tags « *Time » (TimeScale, PosterTime…) mesurent
+    // des durées, pas des dates.
+    const containerDate = tag.name === "CreateDate" || tag.name === "ModifyDate";
+    return containerDate && !NULL_DATE.test(tag.value) ? "dates" : null;
+  }
+
+  if (TECHNICAL.has(tag.name)) return null;
   if (tag.group === "GPS" || tag.name.startsWith("GPS")) return "loc";
-  if (/Date|Time/.test(tag.name)) return "dates";
+  if (isDate(tag.name)) return NULL_DATE.test(tag.value) ? null : "dates";
   if (SOFTWARE_NAMES.has(tag.name)) return "software";
-  if (DEVICE_NAMES.has(tag.name) || MAKER_GROUPS.test(tag.group)) return "device";
+  if (DEVICE_NAMES.has(tag.name) || MAKER_GROUPS.test(tag.group) || /maker.?note/i.test(tag.name))
+    return "device";
   return "other";
 }
 

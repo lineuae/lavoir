@@ -239,6 +239,14 @@ fn signed(value: f64, reference: Option<&str>) -> f64 {
     }
 }
 
+/// « 48.858400 N » / « 2.294500 W » → coordonnée décimale signée. exiftool
+/// restitue ainsi la position vidéo (atome QuickTime) dans le groupe Composite.
+fn parse_signed_coord(v: &str) -> Option<f64> {
+    let mut parts = v.split_whitespace();
+    let value: f64 = parts.next()?.parse().ok()?;
+    Some(signed(value, parts.next()))
+}
+
 fn inspect_one(session: &mut ExifSession, path: &str) -> FileReport {
     let file_name = Path::new(path)
         .file_name()
@@ -297,6 +305,8 @@ fn inspect_one(session: &mut ExifSession, path: &str) -> FileReport {
     let mut gps_lat_ref: Option<String> = None;
     let mut gps_lon: Option<f64> = None;
     let mut gps_lon_ref: Option<String> = None;
+    let mut comp_lat: Option<f64> = None;
+    let mut comp_lon: Option<f64> = None;
     let mut thumb_bytes: Option<u64> = None;
 
     for (key, value) in &obj {
@@ -319,6 +329,13 @@ fn inspect_one(session: &mut ExifSession, path: &str) -> FileReport {
                 "GPSLongitudeRef" => gps_lon_ref = Some(value_to_string(value)),
                 _ => {}
             },
+            // Une vidéo n'a pas de groupe GPS : sa position vient d'un atome
+            // QuickTime, qu'exiftool restitue déjà signée en Composite.
+            "Composite" => match name {
+                "GPSLatitude" => comp_lat = parse_signed_coord(&value_to_string(value)),
+                "GPSLongitude" => comp_lon = parse_signed_coord(&value_to_string(value)),
+                _ => {}
+            },
             _ => {}
         }
 
@@ -337,25 +354,38 @@ fn inspect_one(session: &mut ExifSession, path: &str) -> FileReport {
         });
     }
 
-    if let (Some(lat), Some(lon)) = (gps_lat, gps_lon) {
-        report.gps = Some(GpsFix {
+    report.gps = match (gps_lat, gps_lon) {
+        (Some(lat), Some(lon)) => Some(GpsFix {
             lat: signed(lat, gps_lat_ref.as_deref()),
             lon: signed(lon, gps_lon_ref.as_deref()),
-        });
-    }
+        }),
+        _ => match (comp_lat, comp_lon) {
+            (Some(lat), Some(lon)) => Some(GpsFix { lat, lon }),
+            _ => None,
+        },
+    };
     report.thumbnail = thumb_bytes.map(|bytes| ThumbInfo { bytes });
     report.is_video = report.mime_type.starts_with("video/");
-    report.can_clean = !report.is_video && is_writable_image(&report.file_type);
+    report.can_clean = if report.is_video {
+        is_remuxable_video(&report.file_type)
+    } else {
+        is_writable_image(&report.file_type)
+    };
 
     report
 }
 
-/// Formats image qu'exiftool sait réécrire (le lavage vidéo est phase 3).
+/// Formats image qu'exiftool sait réécrire.
 fn is_writable_image(file_type: &str) -> bool {
     matches!(
         file_type,
         "JPEG" | "PNG" | "WEBP" | "TIFF" | "GIF" | "HEIC" | "HEIF" | "AVIF"
     )
+}
+
+/// Conteneurs qu'on sait laver par remux ffmpeg sans réencodage.
+fn is_remuxable_video(file_type: &str) -> bool {
+    matches!(file_type, "MOV" | "MP4" | "M4V" | "MKV" | "WEBM")
 }
 
 // --- Lavage ------------------------------------------------------------------
@@ -473,6 +503,150 @@ fn clean_one(session: &mut ExifSession, src: &str, mode: &str, dst: PathBuf) -> 
     result
 }
 
+fn is_video_ext(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "mov" | "mp4" | "m4v" | "mkv" | "webm"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Lavage vidéo : remux ffmpeg sans réencodage. On retire toutes les
+/// métadonnées de conteneur et les flux de données Apple (atomes `mebx` :
+/// position, timed metadata) en gardant les pistes A/V bit à bit. Le remux ne
+/// pouvant pas supprimer les dates obligatoires (mvhd/tkhd), ffmpeg les remet à
+/// zéro ; `+bitexact` l'empêche de resigner la sortie avec son tag encoder.
+///
+/// Il n'y a pas de lavage partiel sans réencodage sur une vidéo : les trois
+/// modes image (tout / GPS / date) se ramènent ici au même nettoyage complet.
+fn clean_video(session: &mut ExifSession, ffmpeg: &Path, src: &str, dst: PathBuf) -> CleanResult {
+    let dst_name = dst.file_name().map(|n| n.to_string_lossy().into_owned());
+    let dst_str = dst.to_string_lossy().into_owned();
+
+    let mut result = CleanResult {
+        src: src.to_string(),
+        dst: Some(dst_str.clone()),
+        dst_name,
+        after_tags: Vec::new(),
+        ok: false,
+        error: None,
+    };
+
+    let output = new_command(ffmpeg)
+        .args([
+            "-y",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            src,
+            "-map",
+            "0",
+            "-map",
+            "-0:d",
+            "-map_metadata",
+            "-1",
+            "-c",
+            "copy",
+            "-fflags",
+            "+bitexact",
+            &dst_str,
+        ])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let _ = std::fs::remove_file(&dst);
+            result.dst = None;
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            result.error = Some(
+                stderr
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("ffmpeg n'a pas pu laver cette vidéo")
+                    .trim()
+                    .to_string(),
+            );
+            return result;
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&dst);
+            result.dst = None;
+            result.error = Some(format!("ffmpeg ne démarre pas : {e}"));
+            return result;
+        }
+    }
+
+    result.after_tags = inspect_one(session, &dst_str).tags;
+    result.ok = true;
+    result
+}
+
+// --- Lavage d'un téléchargement (réutilisé par recuperer.rs) -----------------
+
+fn ext_lower(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// Conteneurs A/V qu'on lave par remux ffmpeg (vidéo *et* audio : mêmes flux à
+/// copier bit à bit, mêmes métadonnées de conteneur à retirer).
+fn is_remux_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "mov" | "mp4" | "m4v" | "mkv" | "webm" | "m4a" | "mp3" | "aac" | "opus" | "ogg" | "oga"
+            | "flac" | "wav"
+    )
+}
+
+fn is_image_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "jpg" | "jpeg" | "png" | "webp" | "tiff" | "tif" | "gif" | "heic" | "heif" | "avif"
+    )
+}
+
+/// Lave un fichier fraîchement téléchargé et renvoie le chemin de la copie
+/// propre. yt-dlp/ffmpeg laissent des traces dans le conteneur (URL source dans
+/// un commentaire, tags d'encodeur…) : on repasse par le même nettoyage complet
+/// que les phases 2-3. Format inconnu → rien à laver, on garde le fichier tel
+/// quel (on ne fait jamais échouer un téléchargement sur un type non reconnu).
+pub(crate) fn wash_download(
+    state: &ExifState,
+    ffmpeg: &Path,
+    src: &Path,
+) -> Result<PathBuf, String> {
+    let src_str = src.to_string_lossy().into_owned();
+    let dst = output_path(src, false, 0);
+    let ext = ext_lower(src);
+
+    let result = if is_remux_ext(&ext) {
+        state.with(|s| Ok(clean_video(s, ffmpeg, &src_str, dst.clone())))?
+    } else if is_image_ext(&ext) {
+        state.with(|s| Ok(clean_one(s, &src_str, "all", dst.clone())))?
+    } else {
+        return Ok(src.to_path_buf());
+    };
+
+    if result.ok {
+        result
+            .dst
+            .map(PathBuf::from)
+            .ok_or_else(|| "lavage sans fichier de sortie".to_string())
+    } else {
+        Err(result.error.unwrap_or_else(|| "lavage échoué".to_string()))
+    }
+}
+
 // --- Commandes Tauri ---------------------------------------------------------
 
 #[tauri::command]
@@ -489,13 +663,19 @@ pub fn clean_files(
     paths: Vec<String>,
     options: CleanOptions,
 ) -> Result<Vec<CleanResult>, String> {
+    let ffmpeg = doctor::tool_path("ffmpeg");
     state.with(|session| {
         Ok(paths
             .iter()
             .enumerate()
             .map(|(i, src)| {
-                let dst = output_path(Path::new(src), options.rename_neutral, i);
-                clean_one(session, src, &options.mode, dst)
+                let path = Path::new(src);
+                let dst = output_path(path, options.rename_neutral, i);
+                if is_video_ext(path) {
+                    clean_video(session, &ffmpeg, src, dst)
+                } else {
+                    clean_one(session, src, &options.mode, dst)
+                }
             })
             .collect())
     })
@@ -550,9 +730,10 @@ fn base64_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    // Image-graine sans métadonnée : le test y injecte GPS/appareil/date, puis
-    // vérifie le cycle inspection → lavage → re-scan de bout en bout.
+    // Graines sans métadonnée : les tests y injectent GPS/appareil/date, puis
+    // vérifient le cycle inspection → lavage → re-scan de bout en bout.
     const SEED: &[u8] = include_bytes!("../tests/fixtures/seed.jpg");
+    const SEED_MOV: &[u8] = include_bytes!("../tests/fixtures/seed.mov");
 
     fn session() -> ExifSession {
         let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -560,12 +741,21 @@ mod tests {
         ExifSession::spawn_at(&exe).expect("exiftool doit être installé (fetch-sidecars.ps1)")
     }
 
-    fn temp_seed(name: &str) -> PathBuf {
+    fn ffmpeg() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries/ffmpeg-x86_64-pc-windows-msvc.exe")
+    }
+
+    fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
         let dir = std::env::temp_dir().join("lavoir-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
-        std::fs::write(&path, SEED).unwrap();
+        std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    fn temp_seed(name: &str) -> PathBuf {
+        temp_file(name, SEED)
     }
 
     #[test]
@@ -641,6 +831,55 @@ mod tests {
             result.after_tags.iter().any(|t| t.name == "Make"),
             "le mode GPS seul doit conserver l'appareil",
         );
+
+        let _ = std::fs::remove_file(&src);
+        if let Some(d) = result.dst {
+            let _ = std::fs::remove_file(d);
+        }
+    }
+
+    #[test]
+    fn strips_a_video() {
+        let mut s = session();
+        let ffmpeg = ffmpeg();
+        let src = temp_file("clip.mov", SEED_MOV);
+        let src_str = src.to_string_lossy().into_owned();
+
+        // Position + appareil injectés en atomes QuickTime, comme un iPhone.
+        s.execute(&[
+            "-api",
+            "QuickTimeUTC=1",
+            "-Keys:GPSCoordinates=48.8584 2.2945",
+            "-Keys:Make=Apple",
+            "-Keys:Model=iPhone 14",
+            "-overwrite_original",
+            &src_str,
+        ])
+        .expect("injection exiftool");
+
+        let report = inspect_one(&mut s, &src_str);
+        assert!(report.error.is_none(), "inspection : {:?}", report.error);
+        assert!(report.is_video, "le MOV doit être vu comme une vidéo");
+        assert!(report.can_clean, "un MOV doit être lavable");
+        // La position, absente du groupe GPS, doit venir du Composite QuickTime.
+        let gps = report.gps.expect("la position vidéo doit être détectée");
+        assert!((gps.lat - 48.8584).abs() < 1e-3, "lat = {}", gps.lat);
+        assert!((gps.lon - 2.2945).abs() < 1e-3, "lon = {}", gps.lon);
+
+        let dst = output_path(&src, false, 0);
+        let result = clean_video(&mut s, &ffmpeg, &src_str, dst);
+        assert!(result.ok, "lavage vidéo : {:?}", result.error);
+        assert!(src.exists(), "l'original ne doit pas être supprimé");
+
+        // Le remux ne laisse ni position, ni identité d'appareil.
+        for name in ["GPSCoordinates", "Make", "Model"] {
+            assert!(
+                !result.after_tags.iter().any(|t| t.name == name),
+                "« {name} » survit au lavage vidéo",
+            );
+        }
+        let rescan = inspect_one(&mut s, result.dst.as_ref().unwrap());
+        assert!(rescan.gps.is_none(), "position résiduelle après remux");
 
         let _ = std::fs::remove_file(&src);
         if let Some(d) = result.dst {

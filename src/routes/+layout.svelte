@@ -14,20 +14,21 @@
 </script>
 
 <div class="flex h-screen flex-col">
-  <header class="flex h-[52px] shrink-0 items-center gap-7 border-b border-edge px-5">
+  <header class="flex h-[52px] shrink-0 items-center gap-6 border-b border-edge px-5">
     <span class="text-[15px] font-semibold tracking-tight">lavoir</span>
 
-    <nav class="flex h-full items-center gap-1">
+    <nav class="flex h-full items-center">
       {#each tabs as tab}
         <a
           href={tab.href}
-          class="flex h-full items-center gap-2 border-b-2 px-3 text-[13px] transition-colors
-            {isActive(tab.href)
-            ? 'border-accent text-text'
-            : 'border-transparent text-dim hover:text-text'}"
+          class="relative flex h-full items-center gap-2 px-3 text-[13px] transition-colors
+            {isActive(tab.href) ? 'text-text' : 'text-dim hover:text-text'}"
         >
           <tab.icon size={15} strokeWidth={1.8} />
           {tab.label}
+          {#if isActive(tab.href)}
+            <span class="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-accent"></span>
+          {/if}
         </a>
       {/each}
     </nav>
@@ -38,8 +39,8 @@
       href="/reglages"
       title="Réglages"
       class="rounded-md p-2 transition-colors {isActive('/reglages')
-        ? 'text-text'
-        : 'text-dim hover:text-text'}"
+        ? 'bg-raised text-text'
+        : 'text-dim hover:bg-raised hover:text-text'}"
     >
       <Settings2 size={16} strokeWidth={1.8} />
     </a>

@@ -42,15 +42,15 @@
       {#if preview}
         <img src={preview} alt="" class="size-full object-cover" />
       {:else}
-        <span class="text-[10px] font-medium uppercase tracking-wide text-dim">{report.fileType || "?"}</span>
+        <span class="text-[11px] font-medium uppercase tracking-wide text-dim">{report.fileType || "?"}</span>
       {/if}
     </div>
 
     <!-- Corps -->
     <div class="min-w-0 flex-1">
       <div class="flex items-baseline gap-2">
-        <span class="truncate text-[14px] font-medium" title={report.fileName}>{report.fileName}</span>
-        <span class="shrink-0 rounded bg-raised px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-dim">
+        <span class="truncate text-[13px] font-medium" title={report.fileName}>{report.fileName}</span>
+        <span class="shrink-0 rounded bg-raised px-1.5 py-0.5 text-[11px] uppercase tracking-wide text-dim">
           {report.fileType || ext(report.path)}
         </span>
       </div>
@@ -69,7 +69,7 @@
                   : 'bg-raised text-text'}"
               >
                 {BUCKET_LABELS[b]}
-                <span class="text-dim">{grouped.buckets[b].length}</span>
+                <span class={b === "loc" ? "text-danger/55" : "text-dim"}>{grouped.buckets[b].length}</span>
               </span>
             {/each}
           </div>
@@ -116,7 +116,7 @@
           <div class="mt-2 space-y-2 border-t border-edge pt-2">
             {#each activeBuckets as b}
               <div>
-                <div class="text-[10px] font-medium uppercase tracking-wide text-dim">{BUCKET_LABELS[b]}</div>
+                <div class="text-[11px] font-medium uppercase tracking-wide text-dim">{BUCKET_LABELS[b]}</div>
                 <div class="mt-1 space-y-0.5">
                   {#each grouped.buckets[b] as tag}
                     <div class="flex gap-3 text-[12px]">

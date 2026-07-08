@@ -48,6 +48,20 @@ pub fn tool_path(tool: &str) -> PathBuf {
     beside_exe
 }
 
+/// Construit une commande vers un moteur sans jamais faire clignoter de console
+/// Windows (les sidecars sont des exes console). Point d'entrée unique pour
+/// toute invocation d'un binaire embarqué.
+pub fn command(path: &std::path::Path) -> Command {
+    let mut cmd = Command::new(path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// « ffmpeg version 7.1.1-essentials_build-www.gyan.dev … » → « 7.1.1 » ;
 /// yt-dlp et exiftool impriment déjà le numéro nu.
 fn short_version(tool: &str, stdout: &str) -> String {
@@ -75,14 +89,8 @@ fn probe(tool: &str, flag: &str) -> ToolStatus {
         };
     }
 
-    let mut cmd = Command::new(&path);
+    let mut cmd = command(&path);
     cmd.arg(flag);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
 
     match cmd.output() {
         Ok(out) if out.status.success() => ToolStatus {
