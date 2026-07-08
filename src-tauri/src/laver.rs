@@ -1038,4 +1038,87 @@ mod tests {
             let _ = std::fs::remove_file(d);
         }
     }
+
+    #[test]
+    fn corpus_folder_when_provided() {
+        // Acceptation opt-in : pointe LAVOIR_CORPUS vers un dossier de vrais
+        // médias (dump DCIM, HEIC géotagués…). Chaque fichier est lavé dans un
+        // dossier temporaire — l'original n'est jamais touché — puis on asserte
+        // zéro résidu sensible. Vert et sauté tant que la variable n'est pas là.
+        let Ok(dir) = std::env::var("LAVOIR_CORPUS") else {
+            eprintln!("LAVOIR_CORPUS non défini — test de corpus réel sauté (cf. README).");
+            return;
+        };
+        let work = std::env::temp_dir().join("lavoir-corpus");
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+
+        let mut s = session();
+        let ffmpeg = ffmpeg();
+        let mut washed = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+
+        let entries = std::fs::read_dir(&dir).expect("dossier LAVOIR_CORPUS illisible");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = ext_lower(&path);
+            let (img, vid) = (is_image_ext(&ext), is_remux_ext(&ext));
+            if !img && !vid {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let orig = path.to_string_lossy().into_owned();
+            let before = residue(&inspect_one(&mut s, &orig).tags).len();
+
+            // On lave une copie, jamais l'original.
+            let copy = work.join(&name);
+            std::fs::copy(&path, &copy).unwrap();
+            let copy_str = copy.to_string_lossy().into_owned();
+            let dst = output_path(&copy, false, washed);
+            let result = if vid {
+                clean_video(&mut s, &ffmpeg, &copy_str, dst)
+            } else {
+                clean_one(&mut s, &copy_str, "all", dst)
+            };
+
+            if !result.ok {
+                failures.push(format!("{name} : lavage échoué — {:?}", result.error));
+                continue;
+            }
+            let left = residue(&result.after_tags);
+            eprintln!("{name:<44} {before:>3} → {}", left.len());
+            if !left.is_empty() {
+                failures.push(format!("{name} : résidu {left:?}"));
+            }
+            washed += 1;
+        }
+        let _ = std::fs::remove_dir_all(&work);
+
+        eprintln!("corpus : {washed} fichier(s) lavé(s)");
+        assert!(failures.is_empty(), "corpus — échec(s) :\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn output_path_names_and_avoids_collisions() {
+        let dir = std::env::temp_dir().join("lavoir-outpath");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("photo.jpg");
+        let named = |p: PathBuf| p.file_name().unwrap().to_str().unwrap().to_owned();
+
+        // Suffixe -propre par défaut ; renommage neutre en media-NNNN (1-indexé).
+        assert_eq!(named(output_path(&src, false, 0)), "photo-propre.jpg");
+        assert_eq!(named(output_path(&src, true, 4)), "media-0005.jpg");
+
+        // Collision : on suffixe -2, -3… sans écraser une sortie déjà là.
+        std::fs::write(dir.join("photo-propre.jpg"), b"x").unwrap();
+        assert_eq!(named(output_path(&src, false, 0)), "photo-propre-2.jpg");
+        std::fs::write(dir.join("photo-propre-2.jpg"), b"x").unwrap();
+        assert_eq!(named(output_path(&src, false, 0)), "photo-propre-3.jpg");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
