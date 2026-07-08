@@ -119,3 +119,6 @@ Un lavoir pour les médias : ce qui entre (fichier local ou lien) en ressort pro
 11. SmartScreen / Defender : avertissements attendus, faux positifs yt-dlp
 12. Live Photos iPhone : paire .HEIC + .MOV — laver les deux
 13. Fichiers partiels `.part` de yt-dlp : à couvrir par le janitor
+14. TIFF : `-all=` ne vide pas l'IFD0 (c'est la structure de l'image) → Make/
+    Model/Software/Artist y survivent. Effacement nommé obligatoire
+    (`IDENTITY_STRIP`/`DATE_STRIP` dans `laver.rs`) — trouvé au corpus phase 7

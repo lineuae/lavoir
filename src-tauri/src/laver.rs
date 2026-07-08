@@ -375,11 +375,14 @@ fn inspect_one(session: &mut ExifSession, path: &str) -> FileReport {
     report
 }
 
-/// Formats image qu'exiftool sait réécrire.
+/// Formats image qu'exiftool sait réécrire. « Extended WEBP » est le type que
+/// renvoie exiftool dès qu'un WebP porte des métadonnées (conteneur VP8X) —
+/// c'est-à-dire tout WebP qui vaut la peine d'être lavé ; sans lui, un WebP
+/// géotagué serait affiché comme non lavable.
 fn is_writable_image(file_type: &str) -> bool {
     matches!(
         file_type,
-        "JPEG" | "PNG" | "WEBP" | "TIFF" | "GIF" | "HEIC" | "HEIF" | "AVIF"
+        "JPEG" | "PNG" | "WEBP" | "Extended WEBP" | "TIFF" | "GIF" | "HEIC" | "HEIF" | "AVIF"
     )
 }
 
@@ -416,6 +419,38 @@ fn output_path(src: &Path, rename_neutral: bool, index: usize) -> PathBuf {
     candidate
 }
 
+/// Identité qui survit à `-all=` dans un TIFF : ces tags vivent dans l'IFD0,
+/// qu'exiftool refuse de vider en bloc (c'est la structure même de l'image), si
+/// bien qu'un `-all=` laissait passer Make/Model/Software/Artist… On les efface
+/// donc nommément. C'est un no-op inoffensif sur JPEG/PNG/WebP, où `-all=` les a
+/// déjà retirés (découvert au corpus de la phase 7 sur un vrai TIFF).
+const IDENTITY_STRIP: [&str; 14] = [
+    "-Make=",
+    "-Model=",
+    "-Software=",
+    "-Artist=",
+    "-HostComputer=",
+    "-Copyright=",
+    "-ImageDescription=",
+    "-CameraSerialNumber=",
+    "-SerialNumber=",
+    "-XPTitle=",
+    "-XPComment=",
+    "-XPAuthor=",
+    "-XPKeywords=",
+    "-XPSubject=",
+];
+
+/// Dates qui, pour la même raison que l'identité ci-dessus, subsistent dans
+/// l'IFD0 d'un TIFF après `-all=`. Effacées en mode « tout », recopiées en
+/// mode « garder la date ».
+const DATE_STRIP: [&str; 4] = [
+    "-ModifyDate=",
+    "-DateTimeOriginal=",
+    "-CreateDate=",
+    "-OffsetTimeOriginal=",
+];
+
 fn clean_args<'a>(mode: &str, dst: &'a str) -> Vec<&'a str> {
     let mut args = vec!["-charset", "filename=UTF8"];
     match mode {
@@ -428,9 +463,11 @@ fn clean_args<'a>(mode: &str, dst: &'a str) -> Vec<&'a str> {
             ]);
         }
         "keepDate" => {
-            // Tout retirer, puis recopier orientation, profil couleur et dates.
+            // Tout retirer (identité IFD0 comprise), puis recopier orientation,
+            // profil couleur et dates depuis l'original.
+            args.push("-all=");
+            args.extend(IDENTITY_STRIP);
             args.extend([
-                "-all=",
                 "-tagsFromFile",
                 "@",
                 "-Orientation",
@@ -442,9 +479,13 @@ fn clean_args<'a>(mode: &str, dst: &'a str) -> Vec<&'a str> {
             ]);
         }
         _ => {
-            // "all" — tout retirer sauf orientation (sinon photos couchées)
-            // et profil ICC (sinon couleurs délavées).
-            args.extend(["-all=", "-tagsFromFile", "@", "-Orientation", "-ICC_Profile"]);
+            // "all" — tout retirer (identité et dates résiduelles des TIFF
+            // comprises) sauf orientation (sinon photos couchées) et profil ICC
+            // (sinon couleurs délavées).
+            args.push("-all=");
+            args.extend(IDENTITY_STRIP);
+            args.extend(DATE_STRIP);
+            args.extend(["-tagsFromFile", "@", "-Orientation", "-ICC_Profile"]);
         }
     }
     args.push("-overwrite_original");
@@ -734,6 +775,9 @@ mod tests {
     // vérifient le cycle inspection → lavage → re-scan de bout en bout.
     const SEED: &[u8] = include_bytes!("../tests/fixtures/seed.jpg");
     const SEED_MOV: &[u8] = include_bytes!("../tests/fixtures/seed.mov");
+    const SEED_PNG: &[u8] = include_bytes!("../tests/fixtures/seed.png");
+    const SEED_WEBP: &[u8] = include_bytes!("../tests/fixtures/seed.webp");
+    const SEED_TIFF: &[u8] = include_bytes!("../tests/fixtures/seed.tif");
 
     fn session() -> ExifSession {
         let exe = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -756,6 +800,64 @@ mod tests {
 
     fn temp_seed(name: &str) -> PathBuf {
         temp_file(name, SEED)
+    }
+
+    /// Denylist volontairement indépendante de `classify.ts` : un vrai
+    /// contre-contrôle du lavage, pas une tautologie. Un tag est « sensible »
+    /// s'il révèle la position, l'identité de l'appareil ou de l'auteur,
+    /// l'horodatage de capture, ou une vignette d'avant recadrage. Les dates
+    /// remises à zéro par le remux vidéo (`0000…`) ne comptent pas.
+    fn is_sensitive(tag: &Tag) -> bool {
+        let (g, n, v) = (tag.group.as_str(), tag.name.as_str(), tag.value.trim());
+        if v.is_empty() {
+            return false;
+        }
+        if g == "GPS" || (g == "Composite" && n.starts_with("GPS")) {
+            return true;
+        }
+        if matches!(
+            n,
+            "GPSCoordinates" | "GPSPosition" | "GPSLatitude" | "GPSLongitude"
+                | "GPSAltitude" | "LocationInformation"
+        ) {
+            return true;
+        }
+        if matches!(
+            n,
+            "Make" | "Model" | "Software" | "HostComputer" | "Artist" | "OwnerName"
+                | "CameraID" | "LensModel" | "LensMake" | "XPAuthor" | "XPComment"
+                | "XPKeywords" | "XPSubject" | "XPTitle"
+        ) {
+            return true;
+        }
+        if n.contains("SerialNumber") {
+            return true;
+        }
+        // Atomes de conteneur Apple/Android (position, timed metadata).
+        if n.starts_with("com.apple") || n.starts_with("com.android") {
+            return true;
+        }
+        if matches!(
+            n,
+            "DateTimeOriginal" | "CreateDate" | "ModifyDate" | "OffsetTimeOriginal"
+                | "SubSecDateTimeOriginal"
+        ) {
+            return !v.starts_with("0000");
+        }
+        if matches!(
+            n,
+            "ThumbnailImage" | "ThumbnailLength" | "PreviewImage" | "PreviewImageLength"
+        ) {
+            return true;
+        }
+        false
+    }
+
+    fn residue(tags: &[Tag]) -> Vec<String> {
+        tags.iter()
+            .filter(|t| is_sensitive(t))
+            .map(|t| format!("{}:{} = {}", t.group, t.name, t.value))
+            .collect()
     }
 
     #[test]
@@ -803,6 +905,56 @@ mod tests {
         let _ = std::fs::remove_file(&src);
         if let Some(d) = result.dst {
             let _ = std::fs::remove_file(d);
+        }
+    }
+
+    #[test]
+    fn strips_common_image_formats() {
+        let mut s = session();
+        // TIFF est le cas piège : Make/Model/Software vivent dans l'IFD0 qu'un
+        // `-all=` ne peut pas retirer en bloc — sans l'effacement nommé du
+        // lavage, l'identité de l'appareil survivrait ici.
+        for (bytes, name, want_type) in [
+            (SEED_PNG, "fmt.png", "PNG"),
+            // Un WebP porteur de métadonnées bascule en conteneur étendu (VP8X).
+            (SEED_WEBP, "fmt.webp", "Extended WEBP"),
+            (SEED_TIFF, "fmt.tif", "TIFF"),
+        ] {
+            let src = temp_file(name, bytes);
+            let src_str = src.to_string_lossy().into_owned();
+
+            s.execute(&[
+                "-Make=Apple",
+                "-Model=iPhone 14 Pro",
+                "-Software=iOS 17",
+                "-DateTimeOriginal=2024:07:05 14:32:10",
+                "-GPSLatitude=48.858370",
+                "-GPSLatitudeRef=N",
+                "-GPSLongitude=2.294481",
+                "-GPSLongitudeRef=E",
+                "-overwrite_original",
+                &src_str,
+            ])
+            .unwrap_or_else(|e| panic!("injection {name} : {e}"));
+
+            let report = inspect_one(&mut s, &src_str);
+            assert!(report.error.is_none(), "{name} inspection : {:?}", report.error);
+            assert_eq!(report.file_type, want_type, "{name} : type inattendu");
+            assert!(report.can_clean, "{name} devrait être lavable");
+            assert!(report.gps.is_some(), "{name} : GPS injecté non détecté");
+
+            let dst = output_path(&src, false, 0);
+            let result = clean_one(&mut s, &src_str, "all", dst);
+            assert!(result.ok, "{name} lavage : {:?}", result.error);
+            assert!(src.exists(), "{name} : l'original ne doit pas être supprimé");
+
+            let left = residue(&result.after_tags);
+            assert!(left.is_empty(), "{name} : résidu sensible après lavage : {left:?}");
+
+            let _ = std::fs::remove_file(&src);
+            if let Some(d) = result.dst {
+                let _ = std::fs::remove_file(d);
+            }
         }
     }
 
