@@ -1,5 +1,10 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from "@tauri-apps/plugin-notification";
 import type { Probe, DownloadRequest, DownloadEvent, Settings, UpdateResult } from "./types";
 
 export function probeUrl(url: string): Promise<Probe> {
@@ -19,6 +24,15 @@ export function startDownload(
 
 export function cancelDownload(jobId: string): Promise<void> {
   return invoke("cancel_download", { jobId });
+}
+
+// Prévient quand un téléchargement se termine alors que l'app n'a pas le focus
+// (l'utilisateur est parti faire autre chose — le seul moment où la notification
+// est utile). La permission est demandée à la première fois seulement.
+export async function notifyDownloadDone(name: string): Promise<void> {
+  let granted = await isPermissionGranted();
+  if (!granted) granted = (await requestPermission()) === "granted";
+  if (granted) sendNotification({ title: "Téléchargement terminé", body: name });
 }
 
 export function defaultDestination(): Promise<string> {

@@ -1,6 +1,6 @@
 {
   "name": "lavoir",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Un lavoir pour les médias : tout ressort propre, rien ne reste.",
   "type": "module",
   "license": "MIT",
@@ -16,6 +16,7 @@
     "@lucide/svelte": "^1.23.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.1",
+    "@tauri-apps/plugin-notification": "^2.3.3",
     "@tauri-apps/plugin-opener": "^2.5.4"
   },
   "devDependencies": {

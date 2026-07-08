@@ -9,6 +9,7 @@
     pickDestination,
     getSettings,
     setSettings,
+    notifyDownloadDone,
     QUALITIES,
     looksLikeUrl,
     formatDuration,
@@ -85,6 +86,7 @@
         job.status = "done";
         job.path = ev.path;
         job.name = ev.name;
+        if (!document.hasFocus()) notifyDownloadDone(ev.name);
         break;
       case "failed":
         job.status = "error";
