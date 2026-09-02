@@ -36,14 +36,33 @@ export type CleanEvent = { type: "progress"; src: string; percent: number };
 // --- Récupérer (miroir de recuperer.rs / settings.rs) ------------------------
 
 export type Probe = {
+  mode: "single";
   title: string;
   source: string;
   uploader: string | null;
   durationSeconds: number | null;
   maxHeight: number | null;
   isLive: boolean;
+  kind: "image" | "video";
   webpageUrl: string;
 };
+
+export type Entry = {
+  index: number;
+  title: string;
+  kind: "image" | "video";
+  durationSeconds: number | null;
+  maxHeight: number | null;
+};
+
+export type Listing = {
+  mode: "list";
+  title: string | null;
+  source: string;
+  entries: Entry[];
+};
+
+export type ProbeResult = Probe | Listing;
 
 export type Quality = "best" | "p1080" | "p720" | "audio";
 
@@ -53,6 +72,9 @@ export type DownloadRequest = {
   wash: boolean;
   destination: string;
   cookiesFromBrowser: string | null;
+  source: string | null;
+  kind: "image" | "video" | null;
+  playlistItem: number | null;
 };
 
 // `type` discrimine la variante — même forme que l'enum Rust sérialisé.

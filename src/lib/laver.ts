@@ -1,6 +1,6 @@
 import { invoke, convertFileSrc, Channel } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { openPath, openUrl } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { FileReport, CleanOptions, CleanResult, CleanEvent, GpsFix } from "./types";
 
 const IMAGE_EXTS = ["jpg", "jpeg", "png", "webp", "tiff", "tif", "gif", "heic", "heif", "avif"];
@@ -63,15 +63,13 @@ export function openOnMap(gps: GpsFix): Promise<void> {
   return openUrl(url);
 }
 
+// Ouvre l'Explorateur en sélectionnant le fichier (plutôt que d'ouvrir bêtement
+// le dossier parent) : le fichier fraîchement déposé est directement mis en
+// évidence.
 export function revealFolder(path: string): Promise<void> {
-  return openPath(parentDir(path));
+  return revealItemInDir(path);
 }
 
 export function openFile(path: string): Promise<void> {
   return openPath(path);
-}
-
-function parentDir(path: string): string {
-  const i = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
-  return i > 0 ? path.slice(0, i) : path;
 }

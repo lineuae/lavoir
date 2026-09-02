@@ -22,6 +22,18 @@
 
   let { job }: { job: Job } = $props();
 
+  let openErr = $state<string | null>(null);
+
+  async function reveal(fn: (p: string) => Promise<void>) {
+    if (!job.path) return;
+    openErr = null;
+    try {
+      await fn(job.path);
+    } catch (e) {
+      openErr = String(e);
+    }
+  }
+
   const percent = $derived(
     job.total && job.downloaded !== null ? Math.min(100, (job.downloaded / job.total) * 100) : null,
   );
@@ -72,12 +84,15 @@
           <span class="text-danger">{job.error}</span>
         {/if}
       </p>
+      {#if openErr}
+        <p class="mt-0.5 truncate text-[11px] text-danger" title={openErr}>Ouverture impossible : {openErr}</p>
+      {/if}
     </div>
 
     <div class="flex shrink-0 items-center gap-2">
       {#if job.status === "done"}
-        <button onclick={() => job.path && openFile(job.path)} class="text-[12px] text-dim hover:text-text">Ouvrir</button>
-        <button onclick={() => job.path && revealFolder(job.path)} class="flex items-center gap-1 text-[12px] text-dim hover:text-text">
+        <button onclick={() => reveal(openFile)} class="text-[12px] text-dim hover:text-text">Ouvrir</button>
+        <button onclick={() => reveal(revealFolder)} class="flex items-center gap-1 text-[12px] text-dim hover:text-text">
           <FolderOpen size={12} />Dossier
         </button>
       {:else if active && job.id}

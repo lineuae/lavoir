@@ -5,10 +5,10 @@ import {
   requestPermission,
   sendNotification,
 } from "@tauri-apps/plugin-notification";
-import type { Probe, DownloadRequest, DownloadEvent, Settings, UpdateResult } from "./types";
+import type { ProbeResult, DownloadRequest, DownloadEvent, Settings, UpdateResult } from "./types";
 
-export function probeUrl(url: string): Promise<Probe> {
-  return invoke("probe_url", { url });
+export function probeUrl(url: string, cookiesFromBrowser: string | null): Promise<ProbeResult> {
+  return invoke("probe_url", { url, cookiesFromBrowser });
 }
 
 // Le Channel diffuse la progression jusqu'à l'événement terminal ; on renvoie
