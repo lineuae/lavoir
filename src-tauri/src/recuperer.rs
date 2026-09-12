@@ -724,11 +724,16 @@ struct StillPlan {
     copy: bool,
 }
 
-/// Décide si un média téléchargé est en réalité une image fixe. Une story-photo
-/// (Snap, Insta) qu'une plateforme sert avec une durée d'affichage — ou qu'un
-/// remux a emballée — arrive comme un conteneur d'une seule frame, sans piste
-/// audio. On exige ce signal fort (un flux vidéo, aucun audio, une seule frame)
-/// pour ne jamais confondre une vraie micro-vidéo avec une image.
+/// Décide si un média téléchargé est en réalité une image fixe, à ne jamais
+/// confondre avec une vraie vidéo : il faut d'abord un flux vidéo unique et
+/// aucun audio.
+///
+/// Le signal décisif est le **codec**. Une plateforme qui sert une photo avec
+/// une durée d'affichage (Snap, Insta) l'emballe en un flux Motion-JPEG/PNG :
+/// le conteneur peut alors annoncer plusieurs secondes et un `nb_frames` absent
+/// ou fantaisiste (flux fragmenté), mais le codec, lui, ne ment pas — c'est une
+/// image, qu'on copie sans réencoder. Pour un vrai codec vidéo (h264…), on
+/// n'accepte que la frame unique prouvée.
 fn still_plan(
     video_streams: usize,
     audio_streams: usize,
@@ -736,19 +741,17 @@ fn still_plan(
     nb_frames: Option<u64>,
     duration: Option<f64>,
 ) -> Option<StillPlan> {
-    let single_silent = video_streams == 1 && audio_streams == 0;
-    // nb_frames est la preuve directe ; à défaut (certains conteneurs ne le
-    // renseignent pas), une durée d'une frame environ sert de repli.
-    let one_frame = nb_frames == Some(1)
-        || (nb_frames.is_none() && duration.map(|d| d > 0.0 && d < 0.5).unwrap_or(false));
-    if !(single_silent && one_frame) {
+    if video_streams != 1 || audio_streams != 0 {
         return None;
     }
-    Some(match vcodec {
-        "mjpeg" => StillPlan { ext: "jpg", copy: true },
-        "png" => StillPlan { ext: "png", copy: true },
-        _ => StillPlan { ext: "jpg", copy: false },
-    })
+    match vcodec {
+        "mjpeg" => return Some(StillPlan { ext: "jpg", copy: true }),
+        "png" => return Some(StillPlan { ext: "png", copy: true }),
+        _ => {}
+    }
+    let one_frame = nb_frames == Some(1)
+        || (nb_frames.is_none() && duration.map(|d| d > 0.0 && d < 0.5).unwrap_or(false));
+    one_frame.then_some(StillPlan { ext: "jpg", copy: false })
 }
 
 /// Ce que ffprobe apprend d'un fichier, pour trancher image fixe vs vidéo.
@@ -1463,16 +1466,17 @@ mod tests {
 
     #[test]
     fn still_plan_spots_wrapped_photos() {
-        // Story-photo Snap : 1 frame mjpeg, sans audio → JPEG copié sans perte.
-        let p = still_plan(1, 0, "mjpeg", Some(1), Some(0.04)).unwrap();
-        assert_eq!((p.ext, p.copy), ("jpg", true));
-        // PNG fixe → copié en .png.
-        let p = still_plan(1, 0, "png", Some(1), None).unwrap();
-        assert_eq!((p.ext, p.copy), ("png", true));
-        // Frame unique dans un codec vidéo → JPEG réencodé (pas de copie).
-        let p = still_plan(1, 0, "h264", Some(1), Some(0.04)).unwrap();
-        assert_eq!((p.ext, p.copy), ("jpg", false));
-        // Repli sur une durée d'une frame quand nb_frames manque.
+        let plan = |v, a, c, nf, d| still_plan(v, a, c, nf, d).map(|p| (p.ext, p.copy));
+        // Story-photo Snap : flux mjpeg sans audio → JPEG copié sans perte.
+        assert_eq!(plan(1, 0, "mjpeg", Some(1), Some(0.04)), Some(("jpg", true)));
+        // Cas Snap RÉEL : flux mjpeg fragmenté, nb_frames absent, durée
+        // d'affichage de plusieurs secondes → reconnu image par le codec.
+        assert_eq!(plan(1, 0, "mjpeg", None, Some(5.0)), Some(("jpg", true)));
+        // PNG fixe servi avec une durée → copié en .png.
+        assert_eq!(plan(1, 0, "png", None, Some(3.0)), Some(("png", true)));
+        // Frame unique dans un vrai codec vidéo → JPEG réencodé (pas de copie).
+        assert_eq!(plan(1, 0, "h264", Some(1), Some(0.04)), Some(("jpg", false)));
+        // Repli sur une durée d'une frame quand nb_frames manque (codec vidéo).
         assert!(still_plan(1, 0, "h264", None, Some(0.03)).is_some());
     }
 
@@ -1480,13 +1484,13 @@ mod tests {
     fn still_plan_leaves_real_videos_alone() {
         // Vraie vidéo : plusieurs frames + audio.
         assert!(still_plan(1, 1, "h264", Some(69), Some(2.3)).is_none());
-        // Muette mais longue (nb_frames connu > 1).
+        // Codec vidéo muet mais long (nb_frames > 1) → pas une image.
         assert!(still_plan(1, 0, "h264", Some(300), Some(12.0)).is_none());
-        // Durée longue sans nb_frames → pas une image.
+        // Codec vidéo, durée longue sans nb_frames → pas une image.
         assert!(still_plan(1, 0, "h264", None, Some(12.0)).is_none());
         // Deux flux vidéo → on ne touche pas.
-        assert!(still_plan(2, 0, "mjpeg", Some(1), None).is_none());
-        // Une seule frame mais avec audio → ce n'est pas une image.
-        assert!(still_plan(1, 1, "mjpeg", Some(1), Some(0.04)).is_none());
+        assert!(still_plan(2, 0, "mjpeg", None, Some(5.0)).is_none());
+        // mjpeg mais AVEC une piste audio → c'est une vidéo : on ne touche pas.
+        assert!(still_plan(1, 1, "mjpeg", None, Some(5.0)).is_none());
     }
 }
