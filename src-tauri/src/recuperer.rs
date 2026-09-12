@@ -462,6 +462,15 @@ fn run_download(
         }
     };
 
+    // Une « vidéo » qui n'est en réalité qu'une image fixe (story-photo servie
+    // avec une durée d'affichage, ou emballée en conteneur d'une frame par le
+    // remux) est ramenée à sa vraie image avant lavage et déplacement.
+    let raw = {
+        let ffprobe = doctor::tool_path("ffprobe");
+        let ffmpeg = doctor::tool_path("ffmpeg");
+        recover_still_image(&ffprobe, &ffmpeg, &raw).unwrap_or(raw)
+    };
+
     // Nom final = nom du fichier brut (sans le suffixe de lavage), lavé ou non.
     let final_name = raw
         .file_name()
@@ -699,6 +708,156 @@ fn strip_redundant_ext(path: &Path, junk: &str) -> Option<PathBuf> {
     let cleaned = dedup(path.with_file_name(format!("{base}.{final_ext}")));
     std::fs::rename(path, &cleaned).ok()?;
     Some(cleaned)
+}
+
+// --- Récupération d'une image servie en conteneur vidéo -----------------------
+
+/// Conteneurs vidéo dont on sait ré-extraire une image fixe.
+fn is_video_container(ext: &str) -> bool {
+    matches!(ext, "mp4" | "mov" | "m4v" | "mkv" | "webm")
+}
+
+struct StillPlan {
+    /// Extension de l'image récupérée.
+    ext: &'static str,
+    /// Le flux est déjà une image (JPEG/PNG) : on le copie sans réencoder.
+    copy: bool,
+}
+
+/// Décide si un média téléchargé est en réalité une image fixe. Une story-photo
+/// (Snap, Insta) qu'une plateforme sert avec une durée d'affichage — ou qu'un
+/// remux a emballée — arrive comme un conteneur d'une seule frame, sans piste
+/// audio. On exige ce signal fort (un flux vidéo, aucun audio, une seule frame)
+/// pour ne jamais confondre une vraie micro-vidéo avec une image.
+fn still_plan(
+    video_streams: usize,
+    audio_streams: usize,
+    vcodec: &str,
+    nb_frames: Option<u64>,
+    duration: Option<f64>,
+) -> Option<StillPlan> {
+    let single_silent = video_streams == 1 && audio_streams == 0;
+    // nb_frames est la preuve directe ; à défaut (certains conteneurs ne le
+    // renseignent pas), une durée d'une frame environ sert de repli.
+    let one_frame = nb_frames == Some(1)
+        || (nb_frames.is_none() && duration.map(|d| d > 0.0 && d < 0.5).unwrap_or(false));
+    if !(single_silent && one_frame) {
+        return None;
+    }
+    Some(match vcodec {
+        "mjpeg" => StillPlan { ext: "jpg", copy: true },
+        "png" => StillPlan { ext: "png", copy: true },
+        _ => StillPlan { ext: "jpg", copy: false },
+    })
+}
+
+/// Ce que ffprobe apprend d'un fichier, pour trancher image fixe vs vidéo.
+struct MediaProbe {
+    video_streams: usize,
+    audio_streams: usize,
+    /// Codec du premier flux vidéo.
+    vcodec: String,
+    nb_frames: Option<u64>,
+    duration: Option<f64>,
+}
+
+fn probe_streams(ffprobe: &Path, path: &Path) -> Option<MediaProbe> {
+    let out = doctor::command(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,nb_frames",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let mut video = 0usize;
+    let mut audio = 0usize;
+    let mut vcodec = String::new();
+    let mut nb_frames = None;
+    for s in v.get("streams")?.as_array()? {
+        match s.get("codec_type").and_then(Value::as_str) {
+            Some("video") => {
+                if video == 0 {
+                    vcodec = s
+                        .get("codec_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    nb_frames = s
+                        .get("nb_frames")
+                        .and_then(Value::as_str)
+                        .and_then(|n| n.parse().ok());
+                }
+                video += 1;
+            }
+            Some("audio") => audio += 1,
+            _ => {}
+        }
+    }
+    let duration = v
+        .get("format")
+        .and_then(|f| f.get("duration"))
+        .and_then(Value::as_str)
+        .and_then(|d| d.parse().ok());
+    Some(MediaProbe {
+        video_streams: video,
+        audio_streams: audio,
+        vcodec,
+        nb_frames,
+        duration,
+    })
+}
+
+/// Si le fichier téléchargé est en fait une image fixe, la ré-extrait en vraie
+/// image — copie sans perte quand le flux est déjà du JPEG/PNG — et rend son
+/// chemin ; le conteneur d'origine est supprimé. `None` sinon (vraie vidéo, ou
+/// fichier déjà image).
+fn recover_still_image(ffprobe: &Path, ffmpeg: &Path, path: &Path) -> Option<PathBuf> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !is_video_container(&ext) {
+        return None;
+    }
+    let p = probe_streams(ffprobe, path)?;
+    let plan = still_plan(
+        p.video_streams,
+        p.audio_streams,
+        &p.vcodec,
+        p.nb_frames,
+        p.duration,
+    )?;
+    let out = dedup(path.with_extension(plan.ext));
+
+    let mut cmd = doctor::command(ffmpeg);
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error"])
+        .arg("-i")
+        .arg(path)
+        .args(["-map", "0:v:0", "-frames:v", "1"]);
+    if plan.copy {
+        cmd.args(["-c", "copy"]);
+    }
+    cmd.arg(&out);
+
+    let ok = cmd.output().map(|o| o.status.success()).unwrap_or(false);
+    if !ok || !out.exists() {
+        let _ = std::fs::remove_file(&out);
+        return None;
+    }
+    let _ = std::fs::remove_file(path);
+    Some(out)
 }
 
 fn fail(message: String) -> DownloadEvent {
@@ -1300,5 +1459,34 @@ mod tests {
         std::fs::write(&base, b"x").unwrap();
         assert_eq!(dedup(base.clone()), dir.join("clip (2).mp4"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn still_plan_spots_wrapped_photos() {
+        // Story-photo Snap : 1 frame mjpeg, sans audio → JPEG copié sans perte.
+        let p = still_plan(1, 0, "mjpeg", Some(1), Some(0.04)).unwrap();
+        assert_eq!((p.ext, p.copy), ("jpg", true));
+        // PNG fixe → copié en .png.
+        let p = still_plan(1, 0, "png", Some(1), None).unwrap();
+        assert_eq!((p.ext, p.copy), ("png", true));
+        // Frame unique dans un codec vidéo → JPEG réencodé (pas de copie).
+        let p = still_plan(1, 0, "h264", Some(1), Some(0.04)).unwrap();
+        assert_eq!((p.ext, p.copy), ("jpg", false));
+        // Repli sur une durée d'une frame quand nb_frames manque.
+        assert!(still_plan(1, 0, "h264", None, Some(0.03)).is_some());
+    }
+
+    #[test]
+    fn still_plan_leaves_real_videos_alone() {
+        // Vraie vidéo : plusieurs frames + audio.
+        assert!(still_plan(1, 1, "h264", Some(69), Some(2.3)).is_none());
+        // Muette mais longue (nb_frames connu > 1).
+        assert!(still_plan(1, 0, "h264", Some(300), Some(12.0)).is_none());
+        // Durée longue sans nb_frames → pas une image.
+        assert!(still_plan(1, 0, "h264", None, Some(12.0)).is_none());
+        // Deux flux vidéo → on ne touche pas.
+        assert!(still_plan(2, 0, "mjpeg", Some(1), None).is_none());
+        // Une seule frame mais avec audio → ce n'est pas une image.
+        assert!(still_plan(1, 1, "mjpeg", Some(1), Some(0.04)).is_none());
     }
 }
