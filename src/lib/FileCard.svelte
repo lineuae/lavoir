@@ -24,6 +24,7 @@
   let copied = $state(false);
   let thumbSrc = $state<string | null>(null);
   let thumbLoading = $state(false);
+  let thumbFailed = $state(false);
 
   async function copyGps() {
     if (!report.gps) return;
@@ -34,8 +35,10 @@
 
   async function showThumbnail() {
     thumbLoading = true;
-    thumbSrc = await extractThumbnail(report.path);
+    const src = await extractThumbnail(report.path);
     thumbLoading = false;
+    if (src) thumbSrc = src;
+    else thumbFailed = true;
   }
 
   const fmtBytes = (n: number) => (n < 1024 ? `${n} o` : `${(n / 1024).toFixed(1)} Ko`);
@@ -65,6 +68,10 @@
         <p class="mt-1 text-[13px] text-danger">{report.error}</p>
       {:else}
         <p class="mt-1 text-[13px] text-dim">{shock}</p>
+
+        {#if !report.canClean}
+          <p class="mt-1.5 text-[12px] text-faint">Format non pris en charge — lavage impossible ici.</p>
+        {/if}
 
         {#if activeBuckets.length > 0}
           <div class="mt-2.5 flex flex-wrap gap-1.5">
@@ -101,6 +108,9 @@
             {#if thumbSrc}
               <img src={thumbSrc} alt="vignette intégrée" class="h-12 rounded border border-edge" />
               <span class="text-[11px] leading-tight text-dim">Vignette intégrée — elle peut montrer<br />l'image d'avant recadrage.</span>
+            {:else if thumbFailed}
+              <Image size={13} class="text-faint" />
+              <span class="text-[11px] text-faint">Vignette illisible à cet emplacement.</span>
             {:else}
               <Image size={13} class="text-dim" />
               <span class="text-[11px] text-dim">Vignette intégrée cachée ({fmtBytes(report.thumbnail.bytes)})</span>

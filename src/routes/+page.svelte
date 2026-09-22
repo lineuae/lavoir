@@ -23,6 +23,10 @@
   ];
 
   const cleanable = $derived(reports.filter((r) => r.canClean && !r.error));
+  // À laver = lavable et pas encore lavé avec succès : re-cliquer « Laver »
+  // ne relave donc pas ce qui est déjà propre (fini les doublons `-propre-2`).
+  const pending = $derived(cleanable.filter((r) => !results[r.path]?.ok));
+  const pendingPaths = $derived(new Set(pending.map((r) => r.path)));
   const known = $derived(new Set(reports.map((r) => r.path)));
   const hasVideo = $derived(reports.some((r) => r.isVideo));
 
@@ -43,12 +47,12 @@
   }
 
   async function washAll() {
-    if (cleanable.length === 0 || cleaning) return;
+    if (pending.length === 0 || cleaning) return;
     cleaning = true;
     progress = {};
     try {
       const done = await cleanFiles(
-        cleanable.map((r) => r.path),
+        pending.map((r) => r.path),
         { mode, renameNeutral },
         (ev) => (progress = { ...progress, [ev.src]: ev.percent }),
       );
@@ -163,11 +167,15 @@
       </button>
       <button
         onclick={washAll}
-        disabled={cleaning || cleanable.length === 0}
+        disabled={cleaning || pending.length === 0}
         class="rounded-md bg-accent px-3.5 py-1.5 text-[13px] font-medium text-bg transition-opacity
           hover:opacity-90 disabled:opacity-40"
       >
-        {cleaning ? "Lavage…" : `Laver ${cleanable.length} fichier${cleanable.length > 1 ? "s" : ""}`}
+        {cleaning
+          ? "Lavage…"
+          : pending.length === 0
+            ? "Tout est lavé"
+            : `Laver ${pending.length} fichier${pending.length > 1 ? "s" : ""}`}
       </button>
     </div>
 
@@ -179,8 +187,8 @@
       {#each reports as report (report.path)}
         <FileCard
           {report}
-          result={results[report.path] ?? null}
-          busy={cleaning && !results[report.path] && report.canClean && !report.error}
+          result={cleaning && pendingPaths.has(report.path) ? null : (results[report.path] ?? null)}
+          busy={cleaning && pendingPaths.has(report.path)}
           progress={progress[report.path] ?? null}
         />
       {/each}

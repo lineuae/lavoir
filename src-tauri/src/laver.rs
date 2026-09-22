@@ -400,7 +400,7 @@ fn is_writable_image(file_type: &str) -> bool {
 
 /// Conteneurs qu'on sait laver par remux ffmpeg sans réencodage.
 fn is_remuxable_video(file_type: &str) -> bool {
-    matches!(file_type, "MOV" | "MP4" | "M4V" | "MKV" | "WEBM")
+    matches!(file_type, "MOV" | "MP4" | "M4V" | "MKV" | "WEBM" | "AVI")
 }
 
 // --- Lavage ------------------------------------------------------------------
@@ -562,7 +562,7 @@ fn is_video_ext(path: &Path) -> bool {
         .map(|e| {
             matches!(
                 e.to_ascii_lowercase().as_str(),
-                "mov" | "mp4" | "m4v" | "mkv" | "webm"
+                "mov" | "mp4" | "m4v" | "mkv" | "webm" | "avi"
             )
         })
         .unwrap_or(false)
@@ -795,17 +795,17 @@ pub fn clean_files(
 #[tauri::command]
 pub fn extract_thumbnail(path: String) -> Option<String> {
     let exiftool = doctor::tool_path("exiftool");
-    let output = new_command(&exiftool)
-        .args(["-b", "-ThumbnailImage", &path])
-        .output()
-        .ok()?;
-    if output.stdout.is_empty() {
-        return None;
+    // `report.thumbnail` est posé sur ThumbnailLength *ou* PreviewImageLength :
+    // on tente les deux, sinon « Révéler » resterait sans effet sur un fichier
+    // qui ne porte qu'un PreviewImage (RAW, certains JPEG).
+    for tag in ["-ThumbnailImage", "-PreviewImage"] {
+        if let Ok(output) = new_command(&exiftool).args(["-b", tag, &path]).output() {
+            if !output.stdout.is_empty() {
+                return Some(format!("data:image/jpeg;base64,{}", base64_encode(&output.stdout)));
+            }
+        }
     }
-    Some(format!(
-        "data:image/jpeg;base64,{}",
-        base64_encode(&output.stdout)
-    ))
+    None
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -1177,6 +1177,15 @@ mod tests {
         assert_eq!(remux_percent(500, 1000), Some(50.0));
         // La sortie peut dépasser l'entrée d'un cheveu : borné à 99, jamais 100+.
         assert_eq!(remux_percent(1010, 1000), Some(99.0));
+    }
+
+    #[test]
+    fn avi_is_a_washable_video() {
+        // Régression : l'UI acceptait `.avi` en entrée mais le back le déclarait
+        // non lavable — impasse silencieuse. Le remux ffmpeg le nettoie bien.
+        assert!(is_remuxable_video("AVI"));
+        assert!(is_video_ext(Path::new("clip.avi")));
+        assert!(is_video_ext(Path::new("CLIP.AVI")));
     }
 
     #[test]
