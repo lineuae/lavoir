@@ -1,6 +1,6 @@
 [package]
 name = "lavoir"
-version = "1.1.1"
+version = "1.1.2"
 description = "Un lavoir pour les médias : tout ressort propre, rien ne reste."
 authors = ["linel"]
 edition = "2021"
