@@ -48,6 +48,12 @@ pub struct Probe {
     /// l'emballe dans un mp4 de 0 s).
     kind: &'static str,
     webpage_url: String,
+    /// Rang `--playlist-items` quand ce « média isolé » est en fait l'unique
+    /// snap d'un lien de partage revenu en playlist de représentations
+    /// dupliquées (cf. `dedupe_representations`) : le téléchargement vise ce
+    /// rang plutôt que de relancer `--no-playlist`, qui ramènerait aussi les
+    /// leurres. `None` pour une vraie vidéo isolée (YouTube…).
+    playlist_item: Option<u32>,
 }
 
 /// Une entrée d'un profil/liste (une story parmi d'autres). `index` est le
@@ -86,8 +92,25 @@ pub enum ProbeResult {
 /// entrée est extraite en entier pour connaître son type photo/vidéo).
 const LIST_LIMIT: &str = "100";
 
+/// Suit le process de la sonde en cours pour pouvoir l'interrompre : extraire un
+/// profil de 100 entrées peut prendre du temps, et l'utilisateur doit pouvoir
+/// annuler (ou quitter la vue) sans laisser un yt-dlp tourner en fond.
+#[derive(Default)]
+pub struct ProbeManager {
+    pid: AtomicU32,
+}
+
 #[tauri::command]
-pub fn probe_url(url: String, cookies_from_browser: Option<String>) -> Result<ProbeResult, String> {
+pub fn cancel_probe(probe: State<ProbeManager>) {
+    kill_tree(probe.pid.swap(0, Ordering::Relaxed));
+}
+
+#[tauri::command]
+pub fn probe_url(
+    probe: State<ProbeManager>,
+    url: String,
+    cookies_from_browser: Option<String>,
+) -> Result<ProbeResult, String> {
     let yt = doctor::tool_path("yt-dlp");
     let mut cmd = doctor::command(&yt);
     // `--no-playlist` ne réduit que les URLs « vidéo + playlist » (un lien
@@ -111,11 +134,21 @@ pub fn probe_url(url: String, cookies_from_browser: Option<String>) -> Result<Pr
             cmd.arg("--cookies-from-browser").arg(browser);
         }
     }
-    let out = cmd
-        .arg("--")
-        .arg(&url)
-        .output()
+    cmd.arg("--").arg(&url);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Spawn plutôt que `output()` : on garde le PID pour que `cancel_probe`
+    // puisse tuer l'arbre. Le PID est remis à 0 dès la fin (évite qu'une
+    // annulation tardive ne frappe un process sans rapport après réemploi du PID).
+    let child = cmd
+        .spawn()
         .map_err(|e| format!("yt-dlp ne démarre pas : {e}"))?;
+    probe.pid.store(child.id(), Ordering::Relaxed);
+    let waited = child.wait_with_output();
+    probe.pid.store(0, Ordering::Relaxed);
+    let out = waited.map_err(|e| format!("yt-dlp : {e}"))?;
 
     if !out.status.success() {
         return Err(humanize_error(&String::from_utf8_lossy(&out.stderr)));
@@ -126,7 +159,15 @@ pub fn probe_url(url: String, cookies_from_browser: Option<String>) -> Result<Pr
     let obj = v.as_object().ok_or("réponse illisible de yt-dlp")?;
 
     if obj.get("_type").and_then(|t| t.as_str()) == Some("playlist") {
-        return Ok(ProbeResult::List(parse_listing(obj)));
+        let listing = parse_listing(obj);
+        // Un lien de partage d'un snap isolé revient en « playlist » de
+        // représentations dupliquées : une fois dédoublonné il n'en reste
+        // qu'une, qu'on présente comme un média isolé plutôt qu'une galerie
+        // d'une seule story (fini le « plusieurs options, seul le dernier marche »).
+        if let [only] = listing.entries.as_slice() {
+            return Ok(ProbeResult::Single(single_from_entry(only, &listing, &url)));
+        }
+        return Ok(ProbeResult::List(listing));
     }
     Ok(ProbeResult::Single(parse_media(obj, &url)))
 }
@@ -163,21 +204,13 @@ fn parse_media(obj: &serde_json::Map<String, Value>, url: &str) -> Probe {
             || str_field("live_status") == Some("is_live"),
         kind: media_kind(str_field("ext"), duration, height, str_field("vcodec")),
         webpage_url: str_field("webpage_url").unwrap_or(url).to_string(),
+        playlist_item: None,
     }
 }
 
 fn parse_listing(obj: &serde_json::Map<String, Value>) -> Listing {
     let str_field = |key: &str| obj.get(key).and_then(|x| x.as_str());
-    let entries = obj
-        .get("entries")
-        .and_then(|e| e.as_array())
-        .map(|arr| {
-            arr.iter()
-                .enumerate()
-                .filter_map(|(i, e)| parse_entry(e.as_object()?, i))
-                .collect()
-        })
-        .unwrap_or_default();
+    let entries = dedupe_representations(obj.get("entries").and_then(|e| e.as_array()));
     Listing {
         title: str_field("title")
             .or_else(|| str_field("uploader"))
@@ -187,6 +220,85 @@ fn parse_listing(obj: &serde_json::Map<String, Value>) -> Listing {
             .unwrap_or("")
             .to_string(),
         entries,
+    }
+}
+
+/// Regroupe les entrées d'une playlist par snap et n'en garde qu'une par snap.
+///
+/// L'extracteur générique (Snapchat notamment) renvoie un lien de partage comme
+/// une « playlist » de plusieurs représentations du MÊME snap : deux leurres
+/// dont l'extension est le jeton Snap (« IRZXSOY », que yt-dlp refuse à
+/// l'extraction) et un vrai `mp4`. Sans regroupement, l'app les affiche comme
+/// autant de stories à cocher dont une seule se télécharge — le bug « plusieurs
+/// options, seul le dernier marche ». La clé de snap est `webpage_url_basename`,
+/// identique pour toutes les représentations ; l'`id`, lui, porte un suffixe
+/// `-1/-2/-3` par embed et des paramètres d'URL volatils. On conserve, par snap,
+/// la représentation la plus téléchargeable (extension média réelle plutôt que
+/// jeton), avec son rang d'origine pour `--playlist-items`.
+fn dedupe_representations(entries: Option<&Vec<Value>>) -> Vec<Entry> {
+    let Some(arr) = entries else {
+        return Vec::new();
+    };
+    let mut order: Vec<String> = Vec::new();
+    let mut best: HashMap<String, (u8, Entry)> = HashMap::new();
+    for (i, e) in arr.iter().enumerate() {
+        let Some(eo) = e.as_object() else { continue };
+        let Some(entry) = parse_entry(eo, i) else { continue };
+        let key = snap_key(eo, i);
+        let rank = ext_rank(eo.get("ext").and_then(Value::as_str));
+        let replace = match best.get(&key) {
+            Some((seen, _)) => rank > *seen,
+            None => {
+                order.push(key.clone());
+                true
+            }
+        };
+        if replace {
+            best.insert(key, (rank, entry));
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|k| best.remove(&k).map(|(_, entry)| entry))
+        .collect()
+}
+
+/// Identifiant stable d'un snap, indépendant de la représentation. À défaut
+/// (vrais extracteurs qui ne l'exposent pas), une clé unique par position — pour
+/// ne jamais fusionner par erreur deux médias distincts.
+fn snap_key(eo: &serde_json::Map<String, Value>, position: usize) -> String {
+    match eo.get("webpage_url_basename").and_then(Value::as_str) {
+        Some(b) if !b.is_empty() => b.to_string(),
+        _ => format!("#{position}"),
+    }
+}
+
+/// Classe une extension par « téléchargeabilité » : un conteneur vidéo réel
+/// prime une image, qui prime une extension inconnue (le jeton Snap), qui prime
+/// l'absence d'extension.
+fn ext_rank(ext: Option<&str>) -> u8 {
+    match ext.map(|e| e.to_ascii_lowercase()) {
+        Some(e) if is_video_container(&e) => 3,
+        Some(e) if IMAGE_EXTS.contains(&e.as_str()) => 2,
+        Some(_) => 1,
+        None => 0,
+    }
+}
+
+/// Construit un média isolé à partir de l'unique snap restant après
+/// dédoublonnage : le téléchargement visera `playlist_item` (le rang de la vraie
+/// représentation) au lieu de relancer l'extraction complète.
+fn single_from_entry(entry: &Entry, listing: &Listing, url: &str) -> Probe {
+    Probe {
+        title: entry.title.clone(),
+        source: listing.source.clone(),
+        uploader: listing.title.clone(),
+        duration_seconds: entry.duration_seconds,
+        max_height: entry.max_height,
+        is_live: false,
+        kind: entry.kind,
+        webpage_url: url.to_string(),
+        playlist_item: Some(entry.index),
     }
 }
 
@@ -221,23 +333,36 @@ fn parse_entry(eo: &serde_json::Map<String, Value>, position: usize) -> Option<E
     })
 }
 
-/// Distingue une image d'une vidéo à partir des métadonnées yt-dlp. Une story
-/// photo n'a pas de durée, pas de hauteur, pas de codec vidéo ; une extension
-/// image tranche aussi directement le cas. Tout le reste est traité en vidéo —
-/// un faux négatif fait au pire échouer proprement, jamais un mp4 muet de 0 s.
+/// Extensions reconnues comme image, partagées par la détection de type et le
+/// classement des représentations d'une playlist (`ext_rank`).
+const IMAGE_EXTS: [&str; 7] = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "heic"];
+
+/// Distingue une image d'une vidéo. L'extension tranche en premier : une
+/// extension image donne « image », un conteneur vidéo donne « vidéo ». Sans
+/// extension exploitable (le jeton Snap, ou rien), on retombe sur les
+/// métadonnées — mais « image » exige alors un signal *positif* d'absence de
+/// flux vidéo (`vcodec == "none"`). L'absence pure de codec, elle, est la
+/// signature de l'extracteur générique : une vraie vidéo Snap arrive sans durée,
+/// sans hauteur, sans codec — la prendre pour une photo était le bug. Le doute
+/// restant part en vidéo ; `recover_still_image` rattrape après téléchargement
+/// une image qui aurait été mal rangée.
 fn media_kind(
     ext: Option<&str>,
     duration: Option<f64>,
     height: Option<u64>,
     vcodec: Option<&str>,
 ) -> &'static str {
-    const IMAGE_EXTS: [&str; 7] = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "heic"];
-    let image_ext = ext
-        .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false);
+    if let Some(e) = ext.map(|e| e.to_ascii_lowercase()) {
+        if IMAGE_EXTS.contains(&e.as_str()) {
+            return "image";
+        }
+        if is_video_container(&e) {
+            return "video";
+        }
+    }
     let has_duration = duration.map(|d| d > 0.0).unwrap_or(false);
-    let no_video = vcodec.map(|v| v == "none").unwrap_or(true);
-    if image_ext || (!has_duration && height.is_none() && no_video) {
+    let no_video = vcodec == Some("none");
+    if !has_duration && height.is_none() && no_video {
         "image"
     } else {
         "video"
@@ -541,7 +666,7 @@ fn download_raw(
     // Réseaux sociaux : le « titre » n'est qu'une légende (« View this Snap
     // from X… ») qui fuiterait dans le dossier de destination — no-trace. On lui
     // substitue un jeton aléatoire. Ailleurs (YouTube…), le vrai titre est utile.
-    let out_template = if randomize_name(req.source.as_deref()) {
+    let out_template = if randomize_name(req.source.as_deref(), &req.url) {
         job_dir.join(format!("{}.%(ext)s", random_stem()))
     } else {
         job_dir.join("%(title).200B.%(ext)s")
@@ -749,8 +874,12 @@ fn still_plan(
         "png" => return Some(StillPlan { ext: "png", copy: true }),
         _ => {}
     }
+    // Le signal fiable est `nb_frames == 1`. Le repli sur la durée ne vaut que
+    // quand `nb_frames` manque : on le borne serré (< 0,1 s ≈ une frame même à
+    // très haut framerate) pour ne pas prendre un vrai clip muet court — un GIF
+    // sans son de quelques dixièmes de seconde — pour une image fixe.
     let one_frame = nb_frames == Some(1)
-        || (nb_frames.is_none() && duration.map(|d| d > 0.0 && d < 0.5).unwrap_or(false));
+        || (nb_frames.is_none() && duration.map(|d| d > 0.0 && d < 0.1).unwrap_or(false));
     one_frame.then_some(StillPlan { ext: "jpg", copy: false })
 }
 
@@ -880,7 +1009,7 @@ fn download_args(quality: &str, is_image: bool) -> Vec<&'static str> {
 
 /// Réseaux sociaux dont le « titre » est une légende sans valeur (et souvent
 /// indiscrète) : on remplace le nom de fichier par un jeton aléatoire.
-fn randomize_name(source: Option<&str>) -> bool {
+fn randomize_name(source: Option<&str>, url: &str) -> bool {
     const SOCIAL: [&str; 7] = [
         "snapchat",
         "instagram",
@@ -890,13 +1019,31 @@ fn randomize_name(source: Option<&str>) -> bool {
         "reddit",
         "threads",
     ];
-    match source {
-        Some(s) => {
-            let s = s.to_ascii_lowercase();
-            SOCIAL.iter().any(|k| s.contains(k))
-        }
+    let has_kw = |s: &str| {
+        let s = s.to_ascii_lowercase();
+        SOCIAL.iter().any(|k| s.contains(k))
+    };
+    // La clé d'extracteur suffit d'ordinaire. Mais un lien de partage social
+    // passe par l'extracteur générique (« Generic »/« HTML5MediaEmbed »), qui ne
+    // trahit pas la plateforme — l'hôte de l'URL, si. Sans ce repli, la légende
+    // du snap fuiterait dans le nom de fichier (entorse au no-trace).
+    if source.map(&has_kw).unwrap_or(false) {
+        return true;
+    }
+    match host_of(url) {
+        Some(h) => has_kw(&h) || h == "x.com" || h.ends_with(".x.com"),
         None => false,
     }
+}
+
+/// Hôte (minuscule) d'une URL, sans dépendance — assez pour reconnaître une
+/// plateforme sociale dans un lien collé.
+fn host_of(url: &str) -> Option<String> {
+    let after = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host = after.split(['/', '?', '#']).next()?;
+    let host = host.rsplit('@').next()?; // userinfo éventuel
+    let host = host.split(':').next()?; // port éventuel
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 /// Jeton aléatoire pour un nom de fichier, sans dépendance : `RandomState` est
@@ -933,9 +1080,12 @@ fn format_args(quality: &str) -> Vec<&'static str> {
         // aléatoire que yt-dlp prend pour une extension « inhabituelle » et
         // refuse ; planifier un remux rend l'extension finale prévisible et lève
         // ce garde-fou. Sur un fichier déjà mp4, le remux est un no-op.
+        // Le repli final `/b` sur les sélecteurs de hauteur évite « format non
+        // disponible » quand la source est mono-format sans hauteur connue (un
+        // média Snap générique) : on prend alors la seule qualité offerte.
         "p720" => vec![
             "-f",
-            "bv*[height<=720]+ba/b[height<=720]",
+            "bv*[height<=720]+ba/b[height<=720]/b",
             "--merge-output-format",
             "mp4",
             "--remux-video",
@@ -943,7 +1093,7 @@ fn format_args(quality: &str) -> Vec<&'static str> {
         ],
         "p1080" => vec![
             "-f",
-            "bv*[height<=1080]+ba/b[height<=1080]",
+            "bv*[height<=1080]+ba/b[height<=1080]/b",
             "--merge-output-format",
             "mp4",
             "--remux-video",
@@ -1404,6 +1554,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_listing_collapses_snap_share_representations() {
+        // Cas RÉEL d'un lien de partage Snapchat : le générique renvoie trois
+        // représentations du même snap (même `webpage_url_basename`) — deux
+        // leurres à extension jeton « IRZXSOY » et le vrai mp4. On ne garde que
+        // le mp4, avec son rang d'origine (3) pour `--playlist-items`.
+        let listing = parse_listing(&obj(serde_json::json!({
+            "_type": "playlist",
+            "title": "ZK",
+            "extractor_key": "Generic",
+            "entries": [
+                {"playlist_index": 1, "title": "View this Snap", "ext": "IRZXSOY",
+                 "vcodec": "none", "webpage_url_basename": "SNAPID", "formats": [{"ext": "IRZXSOY"}]},
+                {"playlist_index": 2, "title": "View this Snap", "ext": "IRZXSOY",
+                 "vcodec": "none", "webpage_url_basename": "SNAPID", "formats": [{"ext": "IRZXSOY"}]},
+                {"playlist_index": 3, "title": "View this Snap", "ext": "mp4",
+                 "vcodec": "none", "webpage_url_basename": "SNAPID", "formats": [{"ext": "mp4"}]}
+            ]
+        })));
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].index, 3);
+
+        // Et présenté comme un média isolé qui vise ce rang au téléchargement.
+        let single = single_from_entry(&listing.entries[0], &listing, "https://snapchat.com/t/xyz");
+        assert_eq!(single.playlist_item, Some(3));
+        assert_eq!(single.source, "Generic");
+    }
+
+    #[test]
+    fn dedupe_keeps_distinct_snaps_apart() {
+        // Deux snaps distincts (basenames différents) ne fusionnent jamais.
+        let listing = parse_listing(&obj(serde_json::json!({
+            "_type": "playlist",
+            "entries": [
+                {"playlist_index": 1, "ext": "mp4", "webpage_url_basename": "A", "formats": [{}]},
+                {"playlist_index": 2, "ext": "mp4", "webpage_url_basename": "B", "formats": [{}]}
+            ]
+        })));
+        assert_eq!(listing.entries.len(), 2);
+    }
+
+    #[test]
     fn parse_entry_defaults_thin_entries_to_video() {
         // Entrée à peine esquissée (extraction paresseuse) : pas de faux « image ».
         let e = parse_entry(&obj(serde_json::json!({"title": "brouillon"})), 4).unwrap();
@@ -1413,15 +1604,31 @@ mod tests {
 
     #[test]
     fn media_kind_spots_images() {
-        // Story-photo : ni durée, ni hauteur, ni codec vidéo.
+        // Extension image explicite → image, quelles que soient les métadonnées.
         assert_eq!(media_kind(Some("jpg"), None, None, Some("none")), "image");
-        assert_eq!(media_kind(None, None, None, None), "image");
-        // Extension image explicite tranche même si le reste est ambigu.
         assert_eq!(media_kind(Some("webp"), Some(0.0), None, None), "image");
+        // Sans extension mais flux vidéo explicitement absent → image (story-photo).
+        assert_eq!(media_kind(None, None, None, Some("none")), "image");
+        // RÉGRESSION Snapchat : une vidéo servie par le générique arrive en mp4
+        // sans durée, sans hauteur, sans codec — c'est une VIDÉO, pas une photo.
+        assert_eq!(media_kind(Some("mp4"), None, None, None), "video");
+        // Aucun signal du tout (ni extension, ni métadonnées) → défaut prudent : vidéo.
+        assert_eq!(media_kind(None, None, None, None), "video");
         // Vraie vidéo : durée présente.
         assert_eq!(media_kind(Some("mp4"), Some(7.0), Some(1080), Some("h264")), "video");
-        // Vidéo sans durée mais avec hauteur → reste vidéo (pas un faux positif).
+        // Vidéo sans durée mais avec hauteur → reste vidéo.
         assert_eq!(media_kind(Some("mp4"), None, Some(720), Some("vp9")), "video");
+    }
+
+    #[test]
+    fn quality_selectors_fall_back_to_best_available() {
+        // Sur un média mono-format sans hauteur (Snap générique), le filtre de
+        // hauteur ne matche rien ; le repli `/b` évite « format non disponible ».
+        for q in ["p720", "p1080"] {
+            let fmt = format_args(q);
+            let sel = fmt[fmt.iter().position(|a| *a == "-f").unwrap() + 1];
+            assert!(sel.ends_with("/b"), "{q} devrait retomber sur /b : {sel}");
+        }
     }
 
     #[test]
@@ -1435,12 +1642,23 @@ mod tests {
 
     #[test]
     fn randomize_name_targets_socials_only() {
-        assert!(randomize_name(Some("Snapchat")));
-        assert!(randomize_name(Some("InstagramStory")));
-        assert!(randomize_name(Some("TikTok")));
-        assert!(!randomize_name(Some("YouTube")));
-        assert!(!randomize_name(Some("Vimeo")));
-        assert!(!randomize_name(None));
+        let neutral = "https://example.com/x";
+        assert!(randomize_name(Some("Snapchat"), neutral));
+        assert!(randomize_name(Some("InstagramStory"), neutral));
+        assert!(randomize_name(Some("TikTok"), neutral));
+        assert!(!randomize_name(Some("YouTube"), "https://youtube.com/watch?v=x"));
+        assert!(!randomize_name(Some("Vimeo"), neutral));
+        assert!(!randomize_name(None, neutral));
+        // Repli sur l'URL : un partage Snap passe par l'extracteur générique,
+        // dont la clé (« Generic »/« HTML5MediaEmbed ») ne dit rien de Snapchat.
+        assert!(randomize_name(Some("Generic"), "https://snapchat.com/t/T8LP5mek"));
+        assert!(randomize_name(
+            Some("HTML5MediaEmbed"),
+            "https://www.snapchat.com/@u/spotlight/xyz"
+        ));
+        assert!(randomize_name(None, "https://x.com/user/status/1"));
+        // Pas de faux positif : « x.com » ne doit pas capturer « netflix.com ».
+        assert!(!randomize_name(Some("Generic"), "https://www.netflix.com/watch/123"));
     }
 
     #[test]
@@ -1488,6 +1706,9 @@ mod tests {
         assert!(still_plan(1, 0, "h264", Some(300), Some(12.0)).is_none());
         // Codec vidéo, durée longue sans nb_frames → pas une image.
         assert!(still_plan(1, 0, "h264", None, Some(12.0)).is_none());
+        // Clip muet court (GIF sans son, ~0,4 s) sans nb_frames → vraie vidéo,
+        // pas une image fixe : on ne le convertit pas en JPEG.
+        assert!(still_plan(1, 0, "h264", None, Some(0.4)).is_none());
         // Deux flux vidéo → on ne touche pas.
         assert!(still_plan(2, 0, "mjpeg", None, Some(5.0)).is_none());
         // mjpeg mais AVEC une piste audio → c'est une vidéo : on ne touche pas.

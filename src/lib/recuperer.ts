@@ -11,6 +11,12 @@ export function probeUrl(url: string, cookiesFromBrowser: string | null): Promis
   return invoke("probe_url", { url, cookiesFromBrowser });
 }
 
+// Interrompt la sonde en cours (tue l'arbre yt-dlp côté Rust). Sans effet si
+// aucune sonde ne tourne.
+export function cancelProbe(): Promise<void> {
+  return invoke("cancel_probe");
+}
+
 // Le Channel diffuse la progression jusqu'à l'événement terminal ; on renvoie
 // l'id du job pour pouvoir l'annuler.
 export function startDownload(

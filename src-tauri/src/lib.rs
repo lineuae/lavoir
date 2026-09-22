@@ -25,6 +25,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .manage(laver::ExifState::default())
         .manage(recuperer::DownloadManager::default())
+        .manage(recuperer::ProbeManager::default())
         .manage(recuperer::LaunchUpdate::default())
         .setup(|app| {
             let handle = app.handle().clone();
@@ -41,6 +42,7 @@ pub fn run() {
             laver::clean_files,
             laver::extract_thumbnail,
             recuperer::probe_url,
+            recuperer::cancel_probe,
             recuperer::start_download,
             recuperer::cancel_download,
             recuperer::default_destination,

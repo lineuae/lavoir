@@ -187,9 +187,11 @@ Subtilités à ne pas perdre :
   vers la destination, puis le sous-dossier est supprimé. `wash_download`
   route par extension : vidéo **et** audio par remux ffmpeg (mêmes flux à
   copier, mêmes métadonnées de conteneur à retirer — un `.m4a` téléchargé porte
-  `Encoder: Lavf…` et un handler `Metadata` que le remux efface), image par
-  exiftool, type inconnu → aucun lavage (on ne fait jamais échouer un
-  téléchargement sur un format non reconnu).
+  `Encoder: Lavf…` et des dates de conteneur que le remux retire via
+  `-map_metadata -1 -fflags +bitexact` ; ffmpeg réémet ensuite un atome `meta`
+  Apple **vide** — structurel, sans aucune donnée, donc non compté par le
+  classifieur), image par exiftool, type inconnu → aucun lavage (on ne fait
+  jamais échouer un téléchargement sur un format non reconnu).
 - **Progression** : `--progress-template` avec un préfixe maison (`LAVOIR\t…`
   pour le téléchargement, `LAVOIR_PP\t…` pour le post-traitement). Un worker par
   job lit stdout **et** stderr fusionnés (la ligne de progression peut sortir

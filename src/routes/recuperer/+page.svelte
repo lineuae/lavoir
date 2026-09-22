@@ -4,6 +4,7 @@
   import type { ProbeResult, Probe, Listing, Entry, Quality, DownloadRequest } from "$lib/types";
   import {
     probeUrl,
+    cancelProbe,
     startDownload,
     defaultDestination,
     pickDestination,
@@ -18,6 +19,7 @@
 
   let url = $state("");
   let probing = $state(false);
+  let cancelledProbe = $state(false);
   let result = $state<ProbeResult | null>(null);
   let probeError = $state<string | null>(null);
 
@@ -60,6 +62,7 @@
     const u = url.trim();
     if (!u || probing) return;
     probing = true;
+    cancelledProbe = false;
     probeError = null;
     result = null;
     selected = [];
@@ -73,10 +76,17 @@
         result = r;
       }
     } catch (e) {
-      probeError = String(e);
+      // Une annulation volontaire rejette aussi la promesse : pas une erreur.
+      if (!cancelledProbe) probeError = String(e);
     } finally {
       probing = false;
     }
+  }
+
+  function cancelProbing() {
+    if (!probing) return;
+    cancelledProbe = true;
+    cancelProbe();
   }
 
   function applyEvent(job: Job, ev: import("$lib/types").DownloadEvent) {
@@ -161,7 +171,7 @@
     if (!single || !canDownloadSingle) return;
     const u = url.trim() || single.webpageUrl;
     enqueue(
-      { ...base(), url: u, source: single.source, kind: single.kind, playlistItem: null },
+      { ...base(), url: u, source: single.source, kind: single.kind, playlistItem: single.playlistItem },
       single.title,
       single.source,
       single.kind !== "image" && quality === "audio",
@@ -231,9 +241,14 @@
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v" && document.activeElement !== inputEl) {
       e.preventDefault();
       pasteFromClipboard();
-    } else if (e.key === "Escape" && (url || result || probeError)) {
-      e.preventDefault();
-      clearInput();
+    } else if (e.key === "Escape") {
+      if (probing) {
+        e.preventDefault();
+        cancelProbing();
+      } else if (url || result || probeError) {
+        e.preventDefault();
+        clearInput();
+      }
     }
   }
 
@@ -270,7 +285,11 @@
     inputEl?.focus();
     window.addEventListener("keydown", onWindowKey);
   });
-  onDestroy(() => window.removeEventListener("keydown", onWindowKey));
+  onDestroy(() => {
+    window.removeEventListener("keydown", onWindowKey);
+    // Quitter la vue en pleine sonde ne doit pas laisser un yt-dlp orphelin.
+    if (probing) cancelProbe();
+  });
 </script>
 
 <section class="mx-auto max-w-2xl px-8 py-10">
@@ -286,7 +305,14 @@
         placeholder:text-faint focus:border-accent focus:outline-none"
     />
     {#if probing}
-      <Loader size={16} class="absolute right-3.5 top-1/2 -translate-y-1/2 animate-spin text-dim" />
+      <button
+        onclick={cancelProbing}
+        title="Annuler l'analyse"
+        class="absolute right-2.5 top-1/2 flex -translate-y-1/2 items-center gap-1.5 rounded px-1.5 py-1 text-[12px] text-dim transition-colors hover:text-danger"
+      >
+        <Loader size={14} class="animate-spin" />
+        Annuler
+      </button>
     {/if}
   </div>
 

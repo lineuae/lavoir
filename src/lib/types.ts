@@ -45,6 +45,7 @@ export type Probe = {
   isLive: boolean;
   kind: "image" | "video";
   webpageUrl: string;
+  playlistItem: number | null;
 };
 
 export type Entry = {
